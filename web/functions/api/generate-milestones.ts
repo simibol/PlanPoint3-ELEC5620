@@ -1,5 +1,11 @@
-// web/functions/api/generate-milestones.ts
-export const onRequestPost: PagesFunction = async ({ request, env }) => {
+/// <reference types="@cloudflare/workers-types" />
+
+interface Env {
+  OPENAI_API_KEY?: string;
+  [key: string]: unknown;
+}
+
+export const onRequestPost: PagesFunction<{ OPENAI_API_KEY?: string }> = async ({ request, env }) => {
   try {
     const { assessment, rubricText } = await request.json() as {
       assessment: { title: string; dueDate: string; weight?: number };
@@ -52,7 +58,7 @@ Return ONLY JSON array:
 
     if (!r.ok) return json({ milestones: simple, source: "rule-based" });
 
-    const data = await r.json();
+    const data = await r.json() as { choices?: { message?: { content?: string } }[] };
     const text = data.choices?.[0]?.message?.content ?? "[]";
     const parsed = JSON.parse(text) as { title:string; offsetDays:number; estimateHrs?:number }[];
 
