@@ -1,13 +1,5 @@
 // web/functions/api/generate-milestones.ts
-import type { PagesFunction } from "@cloudflare/workers-types";
-import { Response as CloudflareResponse } from "@cloudflare/workers-types";
-
-type Env = {
-  OPENAI_API_KEY?: string;
-  [key: string]: unknown;
-};
-
-export const onRequestPost: PagesFunction<{ env: Env }> = async ({ request, env }): Promise<CloudflareResponse> => {
+export const onRequestPost: PagesFunction = async ({ request, env }) => {
   try {
     const { assessment, rubricText } = await request.json() as {
       assessment: { title: string; dueDate: string; weight?: number };
@@ -29,7 +21,7 @@ export const onRequestPost: PagesFunction<{ env: Env }> = async ({ request, env 
       { title: "Finalise & Submit", targetDate: assessment.dueDate, estimateHrs: 1, assessmentTitle: assessment.title },
     ];
 
-    if (!env.env.OPENAI_API_KEY) return json({ milestones: simple, source: "rule-based" });
+    if (!env.OPENAI_API_KEY) return json({ milestones: simple, source: "rule-based" });
 
     const prompt = `
 You help plan student assessments.
@@ -48,7 +40,7 @@ Return ONLY JSON array:
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${env.env.OPENAI_API_KEY}`,
+        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -83,4 +75,4 @@ function M(title:string, offset:number, hrs:number, aTitle:string) {
 function pct(days:number, p:number){ return Math.ceil(days * p); }
 function iso(start:Date, add:number){ const d=new Date(start); d.setDate(d.getDate()+add); return d.toISOString(); }
 function clamp(n:number,min:number,max:number){ n=Math.round(Number(n)||0); return Math.max(min,Math.min(max,n)); }
-function json(obj:any, status=200){ return new CloudflareResponse(JSON.stringify(obj), { status, headers: { "Content-Type":"application/json" }}); }
+function json(obj:any, status=200){ return new Response(JSON.stringify(obj), { status, headers: { "Content-Type":"application/json" }}); }
