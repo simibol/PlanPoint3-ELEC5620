@@ -10,6 +10,8 @@ type Assessment = {
   weight?: number;
   course?: string;
   notes?: string;
+  // NEW: optional PDF file name
+  pdfName?: string;
 };
 
 export default function Ingest() {
@@ -28,7 +30,6 @@ export default function Ingest() {
 
     try {
       if (format === "ics") {
-        // Parse .ics using ical.js
         const jcal = ICAL.parse(text);
         const comp = new ICAL.Component(jcal);
         const events = comp.getAllSubcomponents("vevent");
@@ -43,7 +44,6 @@ export default function Ingest() {
           }
         }
       } else {
-        // Parse CSV with PapaParse (expects headers: title,dueDate,weight,course,notes)
         const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
         for (const r of parsed.data as any[]) {
           if (!r.title || !r.dueDate) continue;
@@ -101,6 +101,8 @@ export default function Ingest() {
                   <th style={{ textAlign: "left" }}>Due</th>
                   <th style={{ textAlign: "left" }}>Weight</th>
                   <th style={{ textAlign: "left" }}>Course</th>
+                  {/* NEW column header for PDF */}
+                  <th style={{ textAlign: "left" }}>Extra Rubrics</th>
                 </tr>
               </thead>
               <tbody>
@@ -135,6 +137,22 @@ export default function Ingest() {
                       style={{ borderBottom: "1px solid #ddd" }}
                     >
                       {r.course ?? ""}
+                    </td>
+                    {/* NEW cell: file input for PDF */}
+                    <td style={{ borderBottom: "1px solid #ddd" }}>
+                      <input
+                        type="file"
+                        accept=".pdf"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            r.pdfName = file.name;
+                            // force update to re-render the table cell
+                            setRows((prev) => prev ? [...prev] : prev);
+                          }
+                        }}
+                      />
+                      {r.pdfName && <small>{r.pdfName}</small>}
                     </td>
                   </tr>
                 ))}
