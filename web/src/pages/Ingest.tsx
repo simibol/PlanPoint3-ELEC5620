@@ -10,6 +10,8 @@ type Assessment = {
   weight?: number;
   course?: string;
   notes?: string;
+  // NEW: optional PDF file name
+  pdfName?: string;
 };
 
 export default function Ingest() {
@@ -28,7 +30,6 @@ export default function Ingest() {
 
     try {
       if (format === "ics") {
-        // Parse .ics using ical.js
         const jcal = ICAL.parse(text);
         const comp = new ICAL.Component(jcal);
         const events = comp.getAllSubcomponents("vevent");
@@ -43,7 +44,6 @@ export default function Ingest() {
           }
         }
       } else {
-        // Parse CSV with PapaParse (expects headers: title,dueDate,weight,course,notes)
         const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
         for (const r of parsed.data as any[]) {
           if (!r.title || !r.dueDate) continue;
@@ -171,23 +171,29 @@ export default function Ingest() {
               </div>
             </div>
 
-            <div style={{
+          <div
+            style={{
               display: 'inline-block',
               position: 'relative',
-              cursor: 'pointer'
-            }}>
-              <input
-                type="file"
-                accept={format === "ics" ? ".ics" : ".csv"}
-                onChange={handleFile}
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  opacity: 0,
-                  cursor: 'pointer'
-                }}
-              />
-              <div style={{
+              cursor: busy ? 'not-allowed' : 'pointer',
+              opacity: busy ? 0.8 : 1,
+              transition: 'opacity 0.2s ease'
+            }}
+          >
+            <input
+              type="file"
+              accept={format === "ics" ? ".ics" : ".csv"}
+              onChange={handleFile}
+              disabled={busy}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                opacity: 0,
+                cursor: busy ? 'not-allowed' : 'pointer'
+              }}
+            />
+            <div
+              style={{
                 background: busy ? '#f3f4f6' : '#4f46e5',
                 color: busy ? '#6b7280' : 'white',
                 padding: '1rem 2rem',
@@ -200,42 +206,54 @@ export default function Ingest() {
                 alignItems: 'center',
                 gap: '0.5rem',
                 transition: 'all 0.2s ease'
-              }}>
-                {busy ? (
-                  <>
-                    <div style={{
+              }}
+            >
+              {busy ? (
+                <>
+                  <div
+                    style={{
                       width: '16px',
                       height: '16px',
                       border: '2px solid #d1d5db',
                       borderTop: '2px solid #6b7280',
                       borderRadius: '50%',
                       animation: 'spin 1s linear infinite'
-                    }}></div>
-                    Parsing file...
-                  </>
-                ) : (
-                  <>
-                    📤 Choose {format.toUpperCase()} File
-                  </>
-                )}
-              </div>
+                    }}
+                  ></div>
+                  Parsing file...
+                </>
+              ) : (
+                <>📤 Choose {format.toUpperCase()} File</>
+              )}
             </div>
-
-            <p style={{ 
-              marginTop: '1rem', 
-              color: '#64748b',
-              fontSize: '0.9rem'
-            }}>
-              {format === "ics" 
-                ? "Upload a calendar file (.ics) exported from your academic calendar"
-                : "Upload a CSV file with columns: title, dueDate, weight, course, notes"
-              }
-            </p>
           </div>
 
-          {rows && (
-            <div style={{ marginTop: '2rem' }}>
-              <div style={{
+          <p
+            style={{
+              marginTop: '1rem',
+              color: '#64748b',
+              fontSize: '0.9rem'
+            }}
+          >
+            {format === "ics"
+              ? "Upload a calendar file (.ics) exported from your academic calendar"
+              : "Upload a CSV file with columns: title, dueDate, weight, course, notes"}
+          </p>
+        </div>
+
+        {rows && (
+          <div style={{ marginTop: '2rem' }}>
+            <h3
+              style={{
+                margin: '0 0 1.25rem 0',
+                color: '#111827',
+                fontSize: '1.25rem',
+                fontWeight: 600
+              }}
+            >
+              Review & Confirm
+            </h3>
+            <div style={{
                 display: 'flex',
                 alignItems: 'center',
                 gap: '0.75rem',
@@ -316,6 +334,15 @@ export default function Ingest() {
                         }}>
                           🎓 Course
                         </th>
+                        <th style={{ 
+                          textAlign: "left",
+                          padding: '1rem',
+                          fontWeight: '600',
+                          color: '#374151',
+                          borderBottom: '2px solid #e5e7eb'
+                        }}>
+                          📎 Extra Rubrics
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -378,12 +405,43 @@ export default function Ingest() {
                             onBlur={(e) => (r.course = e.currentTarget.textContent || undefined)}
                             style={{ 
                               padding: '1rem',
+                              borderRight: '1px solid #f3f4f6',
                               cursor: 'text',
                               color: '#374151',
                               fontWeight: '500'
                             }}
                           >
                             {r.course ?? ""}
+                          </td>
+                          <td
+                            style={{
+                              padding: '1rem',
+                              minWidth: '220px',
+                              color: '#374151',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'flex-start',
+                              gap: '0.5rem'
+                            }}
+                          >
+                            <input
+                              type="file"
+                              accept=".pdf"
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                  r.pdfName = file.name;
+                                  setRows((prev) => (prev ? [...prev] : prev));
+                                }
+                                e.target.value = "";
+                              }}
+                              style={{
+                                fontSize: '0.9rem'
+                              }}
+                            />
+                            {r.pdfName && (
+                              <small style={{ color: '#6b7280' }}>{r.pdfName}</small>
+                            )}
                           </td>
                         </tr>
                       ))}
