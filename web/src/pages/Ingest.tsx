@@ -3,16 +3,7 @@ import { auth, db } from "../firebase";
 import { collection, doc, setDoc } from "firebase/firestore";
 import ICAL from "ical.js";
 import Papa from "papaparse";
-
-type Assessment = {
-  title: string;
-  dueDate: string;          // ISO string
-  weight?: number;
-  course?: string;
-  notes?: string;
-  // NEW: optional PDF file name
-  pdfName?: string;
-};
+import type { Assessment } from "../types";
 
 export default function Ingest() {
   const [format, setFormat] = useState<"ics" | "csv">("ics");

@@ -17,11 +17,17 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     const days = Math.max(1, Math.round((+due - +today) / 86_400_000));
 
     const simple = [
-      M("Topic & Research Plan", pct(days, 0.10), 2, assessment.title),
-      M("Research & Notes",      pct(days, 0.35), 6, assessment.title),
-      M("First Draft",           pct(days, 0.60), 6, assessment.title),
-      M("Revision & Proofread",  pct(days, 0.85), 3, assessment.title),
-      { title: "Finalise & Submit", targetDate: assessment.dueDate, estimateHrs: 1, assessmentTitle: assessment.title },
+      M("Topic & Research Plan", pct(days, 0.10), 2, assessment, today),
+      M("Research & Notes",      pct(days, 0.35), 6, assessment, today),
+      M("First Draft",           pct(days, 0.60), 6, assessment, today),
+      M("Revision & Proofread",  pct(days, 0.85), 3, assessment, today),
+      {
+        title: "Finalise & Submit",
+        targetDate: assessment.dueDate,
+        estimateHrs: 1,
+        assessmentTitle: assessment.title,
+        assessmentDueDate: assessment.dueDate,
+      },
     ];
 
     if (!env.OPENAI_API_KEY) {
@@ -82,6 +88,7 @@ Valid outputs:
       targetDate: iso(today, clamp(m?.offsetDays ?? 0, 0, days)),
       estimateHrs: clamp(m?.estimateHrs ?? 2, 1, 24),
       assessmentTitle: assessment.title,
+      assessmentDueDate: assessment.dueDate,
     }));
 
     console.log("[AI] used OpenAI for:", assessment.title, "→", milestones.length, "items");
@@ -141,8 +148,20 @@ async function callOpenAIWithRetry(
 
 function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
 
-function M(title: string, offset: number, hrs: number, aTitle: string) {
-  return { title, targetDate: iso(new Date(), offset), estimateHrs: hrs, assessmentTitle: aTitle };
+function M(
+  title: string,
+  offset: number,
+  hrs: number,
+  assessment: { title: string; dueDate: string },
+  start: Date
+) {
+  return {
+    title,
+    targetDate: iso(start, offset),
+    estimateHrs: hrs,
+    assessmentTitle: assessment.title,
+    assessmentDueDate: assessment.dueDate,
+  };
 }
 function pct(days: number, p: number) { return Math.ceil(days * p); }
 function iso(start: Date, add: number) { const d = new Date(start); d.setDate(d.getDate() + add); return d.toISOString(); }
