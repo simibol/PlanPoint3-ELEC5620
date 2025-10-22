@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { collection, doc, getDoc, getDocs, setDoc } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc } from "firebase/firestore";
 import { Link } from "react-router-dom";
 import { auth, db } from "../firebase";
 import type {
@@ -10,7 +10,9 @@ import type {
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
+  StoredPlannerPlan,
   generateNotifications,
+  storedPlanToArray,
   withDefaults,
 } from "../lib/planner";
 
@@ -30,7 +32,7 @@ export default function Notifications() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PlannedSession[]>([]);
-  const [states, setStates] = useState<NotificationState[]>([]);
+  const [states, setStates] = useState<Record<string, NotificationState>>({});
   const [preferences, setPreferences] =
     useState<PlannerPreferences>(DEFAULT_PREFERENCES);
   const [success, setSuccess] = useState<string | null>(null);
@@ -41,36 +43,33 @@ export default function Notifications() {
     setError(null);
     (async () => {
       try {
-        const planCol = collection(db, "users", uid, "planSessions");
-        const stateCol = collection(db, "users", uid, "notificationStates");
-        const settingsDoc = doc(db, "users", uid, "settings", "planner");
-        const [planSnap, stateSnap, prefsSnap] = await Promise.all([
-          getDocs(planCol),
-          getDocs(stateCol),
-          getDoc(settingsDoc),
-        ]);
-
-        const fetchedSessions = planSnap.docs
-          .map((d) => ({ ...(d.data() as PlannedSession), id: d.id }))
-          .sort((a, b) => {
-            const dateDiff =
-              parseDate(a.date).getTime() - parseDate(b.date).getTime();
-            if (dateDiff !== 0) return dateDiff;
-            return a.startTime.localeCompare(b.startTime);
-          });
-        setSessions(fetchedSessions);
-
-        setStates(
-          stateSnap.docs.map((d) => ({
-            id: d.id,
-            ...(d.data() as NotificationState),
-          }))
-        );
-
-        if (prefsSnap.exists()) {
-          setPreferences(withDefaults(prefsSnap.data() as PlannerPreferences));
+        const userDocRef = doc(db, "users", uid);
+        const snap = await getDoc(userDocRef);
+        if (snap.exists()) {
+          const data = snap.data() as {
+            plannerPrefs?: PlannerPreferences;
+            plannerPlan?: StoredPlannerPlan;
+            notificationState?: Record<string, NotificationState>;
+          };
+          if (data.plannerPrefs) {
+            setPreferences(withDefaults(data.plannerPrefs));
+          } else {
+            setPreferences(DEFAULT_PREFERENCES);
+          }
+          if (data.plannerPlan) {
+            setSessions(storedPlanToArray(data.plannerPlan));
+          } else {
+            setSessions([]);
+          }
+          if (data.notificationState) {
+            setStates(data.notificationState);
+          } else {
+            setStates({});
+          }
         } else {
           setPreferences(DEFAULT_PREFERENCES);
+          setSessions([]);
+          setStates({});
         }
       } catch (err: any) {
         console.error("[Notifications] load failed:", err);
@@ -82,27 +81,28 @@ export default function Notifications() {
   }, [uid]);
 
   const now = useMemo(() => new Date(), []);
-  const notifications = useMemo(
-    () => generateNotifications(sessions, states, now),
-    [sessions, states, now]
-  );
+  const notifications = useMemo(() => {
+    const stateList = Object.values(states);
+    return generateNotifications(sessions, stateList, now);
+  }, [sessions, states, now]);
 
   const handleDismiss = async (notification: NotificationItem) => {
     if (!uid) return;
     try {
-      await setDoc(
-        doc(db, "users", uid, "notificationStates", notification.id),
-        { id: notification.id, dismissedAt: new Date().toISOString() },
-        { merge: true }
-      );
-      setStates((prev) => {
-        const next = prev.filter((s) => s.id !== notification.id);
-        next.push({
-          id: notification.id,
-          dismissedAt: new Date().toISOString(),
-        });
-        return next;
+      const timestamp = new Date().toISOString();
+      await updateDoc(doc(db, "users", uid), {
+        [`notificationState.${notification.id}`]: {
+          ...(states[notification.id] ?? { id: notification.id }),
+          dismissedAt: timestamp,
+        },
       });
+      setStates((prev) => ({
+        ...prev,
+        [notification.id]: {
+          ...(prev[notification.id] ?? { id: notification.id }),
+          dismissedAt: timestamp,
+        },
+      }));
     } catch (err: any) {
       console.error("[Notifications] dismiss failed:", err);
       setError(err.message || "Unable to dismiss notification.");
@@ -116,16 +116,19 @@ export default function Notifications() {
     if (!uid) return;
     const snoozeUntil = new Date(Date.now() + hours * 3_600_000).toISOString();
     try {
-      await setDoc(
-        doc(db, "users", uid, "notificationStates", notification.id),
-        { id: notification.id, snoozedUntil: snoozeUntil },
-        { merge: true }
-      );
-      setStates((prev) => {
-        const next = prev.filter((s) => s.id !== notification.id);
-        next.push({ id: notification.id, snoozedUntil });
-        return next;
+      await updateDoc(doc(db, "users", uid), {
+        [`notificationState.${notification.id}`]: {
+          ...(states[notification.id] ?? { id: notification.id }),
+          snoozedUntil,
+        },
       });
+      setStates((prev) => ({
+        ...prev,
+        [notification.id]: {
+          ...(prev[notification.id] ?? { id: notification.id }),
+          snoozedUntil,
+        },
+      }));
       setSuccess(`Snoozed "${notification.title}" until ${formatDateTime(
         snoozeUntil
       )}.`);
@@ -138,16 +141,16 @@ export default function Notifications() {
   const markSessionComplete = async (notification: NotificationItem) => {
     if (!uid || !notification.sessionId) return;
     try {
-      const ref = doc(db, "users", uid, "planSessions", notification.sessionId);
-      await setDoc(
-        ref,
-        { status: "complete", updatedAt: new Date().toISOString() },
-        { merge: true }
-      );
+      const ref = doc(db, "users", uid);
+      const timestamp = new Date().toISOString();
+      await updateDoc(ref, {
+        [`plannerPlan.sessions.${notification.sessionId}.status`]: "complete",
+        [`plannerPlan.sessions.${notification.sessionId}.updatedAt`]: timestamp,
+      });
       setSessions((prev) =>
         prev.map((session) =>
           session.id === notification.sessionId
-            ? { ...session, status: "complete" }
+            ? { ...session, status: "complete", updatedAt: timestamp }
             : session
         )
       );

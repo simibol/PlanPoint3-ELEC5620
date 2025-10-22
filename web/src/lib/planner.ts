@@ -23,6 +23,13 @@ export const DEFAULT_PREFERENCES: PlannerPreferences = {
   endHour: 18,
 };
 
+export type StoredPlannerPlan = {
+  version: number;
+  updatedAt: string;
+  sessions: Record<string, PlannedSession>;
+  sessionOrder: string[];
+};
+
 type SubtaskInput = {
   id: string;
   assessmentTitle: string;
@@ -596,6 +603,73 @@ export const buildWeeklySummaries = (
     (a, b) =>
       new Date(a.startDate).getTime() - new Date(b.startDate).getTime()
   );
+};
+
+const sessionSortKey = (session: PlannedSession) =>
+  `${session.date}T${session.startTime}`;
+
+const sortSessions = (sessions: PlannedSession[]) =>
+  [...sessions].sort((a, b) => sessionSortKey(a).localeCompare(sessionSortKey(b)));
+
+export const toStoredPlannerPlan = (plan: PlanResult): StoredPlannerPlan => {
+  const sorted = sortSessions(plan.sessions);
+  const sessionsEntry = Object.fromEntries(
+    sorted.map((session) => [session.id, session])
+  );
+  return {
+    version: plan.version,
+    updatedAt: new Date().toISOString(),
+    sessions: sessionsEntry,
+    sessionOrder: sorted.map((session) => session.id),
+  };
+};
+
+export const storedPlanToArray = (
+  stored?: StoredPlannerPlan | null
+): PlannedSession[] => {
+  if (!stored?.sessions) return [];
+  if (stored.sessionOrder?.length) {
+    return stored.sessionOrder
+      .map((id) => stored.sessions[id])
+      .filter(Boolean)
+      .map((session) => ({ ...session }));
+  }
+  return sortSessions(Object.values(stored.sessions)).map((session) => ({
+    ...session,
+  }));
+};
+
+export const countStoredPlanSessions = (
+  stored?: StoredPlannerPlan | null
+): number =>
+  stored?.sessionOrder?.length ??
+  (stored?.sessions ? Object.keys(stored.sessions).length : 0);
+
+export const mergeSessionsIntoStoredPlan = (
+  existing: StoredPlannerPlan | null | undefined,
+  updatedSessions: PlannedSession[],
+  version: number
+): StoredPlannerPlan => {
+  const baseSessions = existing?.sessions ? { ...existing.sessions } : {};
+  const timestamp = new Date().toISOString();
+  updatedSessions.forEach((session) => {
+    const current = baseSessions[session.id];
+    const merged: PlannedSession = {
+      ...current,
+      ...session,
+      createdAt: current?.createdAt ?? session.createdAt ?? timestamp,
+      status: current?.status ?? session.status,
+      updatedAt: timestamp,
+    };
+    baseSessions[session.id] = merged;
+  });
+  const sorted = sortSessions(Object.values(baseSessions));
+  return {
+    version,
+    updatedAt: timestamp,
+    sessions: Object.fromEntries(sorted.map((session) => [session.id, session])),
+    sessionOrder: sorted.map((session) => session.id),
+  };
 };
 
 export { startOfWeek };

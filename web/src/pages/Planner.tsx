@@ -1,12 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  writeBatch,
-} from "firebase/firestore";
+import { collection, doc, getDoc, getDocs, setDoc } from "firebase/firestore";
 import { auth, db } from "../firebase";
 import type {
   Assessment,
@@ -16,7 +9,10 @@ import type {
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
+  StoredPlannerPlan,
+  countStoredPlanSessions,
   planMilestones,
+  toStoredPlannerPlan,
   withDefaults,
 } from "../lib/planner";
 
@@ -59,30 +55,40 @@ export default function Planner() {
       try {
         const assessmentsCol = collection(db, "users", uid, "assessments");
         const milestonesCol = collection(db, "users", uid, "milestones");
-        const planCol = collection(db, "users", uid, "planSessions");
-        const settingsDoc = doc(db, "users", uid, "settings", "planner");
+        const userDocRef = doc(db, "users", uid);
 
-        const [assSnap, mileSnap, planSnap, prefsSnap] = await Promise.all([
+        const [assSnap, mileSnap, userSnap] = await Promise.all([
           getDocs(assessmentsCol),
           getDocs(milestonesCol),
-          getDocs(planCol),
-          getDoc(settingsDoc),
+          getDoc(userDocRef),
         ]);
 
         setAssessments(assSnap.docs.map((d) => d.data() as Assessment));
         setMilestones(mileSnap.docs.map((d) => d.data() as Milestone));
-        setActivePlanCount(planSnap.size);
-        const firstPlan = planSnap.docs[0]?.data() as
-          | { version?: number }
-          | undefined;
-        setActiveVersion(firstPlan?.version ?? null);
 
-        if (prefsSnap.exists()) {
-          const stored = prefsSnap.data() as PlannerPreferences;
-          setPreferences(withDefaults(stored));
+        if (userSnap.exists()) {
+          const data = userSnap.data() as {
+            plannerPrefs?: PlannerPreferences;
+            plannerPlan?: StoredPlannerPlan;
+          };
+          if (data.plannerPrefs) {
+            setPreferences(withDefaults(data.plannerPrefs));
+          } else {
+            setPreferences(DEFAULT_PREFERENCES);
+          }
+          if (data.plannerPlan) {
+            setActivePlanCount(countStoredPlanSessions(data.plannerPlan));
+            setActiveVersion(data.plannerPlan.version ?? null);
+          } else {
+            setActivePlanCount(0);
+            setActiveVersion(null);
+          }
         } else {
           setPreferences(DEFAULT_PREFERENCES);
+          setActivePlanCount(0);
+          setActiveVersion(null);
         }
+        setPrefDirty(false);
       } catch (err: any) {
         console.error("[Planner] failed to load:", err);
         setError(err.message || "Failed to load planner data.");
@@ -139,8 +145,8 @@ export default function Planner() {
     if (!uid) return;
     try {
       await setDoc(
-        doc(db, "users", uid, "settings", "planner"),
-        preferences,
+        doc(db, "users", uid),
+        { plannerPrefs: preferences },
         { merge: true }
       );
       setPrefDirty(false);
@@ -167,17 +173,19 @@ export default function Planner() {
     setBusy(true);
     setError(null);
     try {
-      const planCol = collection(db, "users", uid, "planSessions");
-      const existing = await getDocs(planCol);
-      const batch = writeBatch(db);
-      existing.docs.forEach((docSnap) => batch.delete(docSnap.ref));
-      plan.sessions.forEach((session) => {
-        batch.set(doc(planCol, session.id), session);
-      });
-      await batch.commit();
-      await handleSavePreferences();
-      setActivePlanCount(plan.sessions.length);
-      setActiveVersion(plan.version);
+      const userDocRef = doc(db, "users", uid);
+      const storedPlan = toStoredPlannerPlan(plan);
+      await setDoc(
+        userDocRef,
+        {
+          plannerPrefs: preferences,
+          plannerPlan: storedPlan,
+        },
+        { merge: true }
+      );
+      setPrefDirty(false);
+      setActivePlanCount(countStoredPlanSessions(storedPlan));
+      setActiveVersion(storedPlan.version);
       setSuccessMessage(
         `Plan applied (${plan.sessions.length} sessions scheduled).`
       );

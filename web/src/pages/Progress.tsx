@@ -1,12 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  setDoc,
-  writeBatch,
-} from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc } from "firebase/firestore";
 import { auth, db } from "../firebase";
 import type {
   PlannerPreferences,
@@ -16,9 +9,12 @@ import type {
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
+  StoredPlannerPlan,
   buildWeeklySummaries,
+  mergeSessionsIntoStoredPlan,
   rescheduleSessions,
   startOfWeek,
+  storedPlanToArray,
   withDefaults,
 } from "../lib/planner";
 
@@ -48,6 +44,7 @@ export default function Progress() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PlannedSession[]>([]);
+  const [storedPlan, setStoredPlan] = useState<StoredPlannerPlan | null>(null);
   const [preferences, setPreferences] =
     useState<PlannerPreferences>(DEFAULT_PREFERENCES);
   const [rescheduleContext, setRescheduleContext] =
@@ -60,29 +57,29 @@ export default function Progress() {
     setError(null);
     (async () => {
       try {
-        const planCol = collection(db, "users", uid, "planSessions");
-        const prefsDoc = doc(db, "users", uid, "settings", "planner");
-        const [planSnap, prefSnap] = await Promise.all([
-          getDocs(planCol),
-          getDoc(prefsDoc),
-        ]);
-        const fetched = planSnap.docs
-          .map((d) => {
-            const data = d.data() as PlannedSession;
-            return { ...data, id: d.id };
-          })
-          .sort((a, b) => {
-            const dateDiff =
-              parseDate(a.date).getTime() - parseDate(b.date).getTime();
-            if (dateDiff !== 0) return dateDiff;
-            return a.startTime.localeCompare(b.startTime);
-          });
-        setSessions(fetched);
-
-        if (prefSnap.exists()) {
-          setPreferences(withDefaults(prefSnap.data() as PlannerPreferences));
+        const userDocRef = doc(db, "users", uid);
+        const snap = await getDoc(userDocRef);
+        if (snap.exists()) {
+          const data = snap.data() as {
+            plannerPrefs?: PlannerPreferences;
+            plannerPlan?: StoredPlannerPlan;
+          };
+          if (data.plannerPrefs) {
+            setPreferences(withDefaults(data.plannerPrefs));
+          } else {
+            setPreferences(DEFAULT_PREFERENCES);
+          }
+          if (data.plannerPlan) {
+            setStoredPlan(data.plannerPlan);
+            setSessions(storedPlanToArray(data.plannerPlan));
+          } else {
+            setStoredPlan(null);
+            setSessions([]);
+          }
         } else {
           setPreferences(DEFAULT_PREFERENCES);
+          setStoredPlan(null);
+          setSessions([]);
         }
       } catch (err: any) {
         console.error("[Progress] load failed:", err);
@@ -141,20 +138,33 @@ export default function Progress() {
     if (!uid) return;
     const newStatus = session.status === "complete" ? "pending" : "complete";
     try {
-      const ref = doc(db, "users", uid, "planSessions", session.id);
-      await setDoc(
-        ref,
-        {
-          status: newStatus,
-          updatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
+      const ref = doc(db, "users", uid);
+      const timestamp = new Date().toISOString();
+      await updateDoc(ref, {
+        [`plannerPlan.sessions.${session.id}.status`]: newStatus,
+        [`plannerPlan.sessions.${session.id}.updatedAt`]: timestamp,
+      });
       setSessions((prev) =>
         prev.map((item) =>
-          item.id === session.id ? { ...item, status: newStatus } : item
+          item.id === session.id
+            ? { ...item, status: newStatus, updatedAt: timestamp }
+            : item
         )
       );
+      setStoredPlan((prev) => {
+        if (!prev?.sessions?.[session.id]) return prev;
+        return {
+          ...prev,
+          sessions: {
+            ...prev.sessions,
+            [session.id]: {
+              ...prev.sessions[session.id],
+              status: newStatus,
+              updatedAt: timestamp,
+            },
+          },
+        };
+      });
     } catch (err: any) {
       console.error("[Progress] toggle failed:", err);
       setError(err.message || "Unable to update session status.");
@@ -205,34 +215,33 @@ export default function Progress() {
     setBusy(true);
     setError(null);
     try {
-      const batch = writeBatch(db);
-      const colRef = collection(db, "users", uid, "planSessions");
       const timestamp = new Date().toISOString();
-
-      plan.sessions.forEach((session) => {
+      const mergedSessions = plan.sessions.map((session) => {
         const prior = original.get(session.id);
-        const update: PlannedSession = {
+        return {
+          ...prior,
           ...session,
-          rolledFromDate: prior?.rolledFromDate ?? prior?.date ?? session.rolledFromDate,
+          createdAt: prior?.createdAt ?? session.createdAt ?? timestamp,
+          status: prior?.status ?? session.status,
+          rolledFromDate:
+            prior?.rolledFromDate ?? prior?.date ?? session.rolledFromDate,
           updatedAt: timestamp,
         };
-        batch.set(doc(colRef, session.id), update, { merge: true });
       });
-
-      await batch.commit();
-      setSessions((prev) =>
-        prev.map((existing) => {
-          const updated = plan.sessions.find((s) => s.id === existing.id);
-          if (!updated) return existing;
-          const prior = original.get(existing.id);
-          return {
-            ...existing,
-            ...updated,
-            rolledFromDate:
-              prior?.rolledFromDate ?? prior?.date ?? existing.rolledFromDate,
-          };
-        })
+      const mergedPlan = mergeSessionsIntoStoredPlan(
+        storedPlan,
+        mergedSessions,
+        plan.version
       );
+      await setDoc(
+        doc(db, "users", uid),
+        {
+          plannerPlan: mergedPlan,
+        },
+        { merge: true }
+      );
+      setStoredPlan(mergedPlan);
+      setSessions(storedPlanToArray(mergedPlan));
       setSuccess(`${rescheduleContext.label} applied.`);
       setRescheduleContext(null);
     } catch (err: any) {
