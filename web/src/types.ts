@@ -25,8 +25,14 @@ export type PlannerPreferences = {
   endHour: number;
 };
 
-export type SessionStatus = "pending" | "complete";
-export type RiskLevel = "on-track" | "warning" | "at-risk";
+export type SessionStatus =
+  | "planned"
+  | "in-progress"
+  | "completed"
+  | "todo"; // include the two you actually plan to use
+
+  export type RiskLevel = "on-track" | "warning" | "late" | "at-risk"; // include "late" and "at-risk"
+
 
 export type PlannedSession = {
   id: string;
