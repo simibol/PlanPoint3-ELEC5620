@@ -34,9 +34,9 @@ export type PlannedSession = {
   assessmentDueDate: string;
   milestoneTitle: string;
   subtaskTitle: string;
-  date: string;          // YYYY-MM-DD
-  startTime: string;     // HH:mm
-  endTime: string;       // HH:mm
+  date: string; // YYYY-MM-DD
+  startTime: string; // HH:mm
+  endTime: string; // HH:mm
   durationHours: number;
   status: SessionStatus;
   notes?: string;
@@ -97,4 +97,19 @@ export type WeeklyProgress = {
   plannedHours: number;
   completedHours: number;
   status: "on-track" | "behind" | "at-risk";
+};
+
+export type PlanSession = {
+  id: string;
+  date: string; // YYYY-MM-DD
+  startTime: string; // "HH:MM"
+  endTime: string; // "HH:MM"
+  durationHours: number;
+  assessmentTitle: string;
+  assessmentDueDate: string; // YYYY-MM-DD
+  milestoneTitle: string;
+  subtaskTitle: string;
+  notes?: string;
+  riskLevel: "on-track" | "warning" | "late";
+  done?: boolean; // ← add this
 };
