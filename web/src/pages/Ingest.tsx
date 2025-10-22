@@ -171,92 +171,29 @@ export default function Ingest() {
               </div>
             </div>
 
-      {rows && (
-        <>
-          <h3>Review & Confirm</h3>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ borderCollapse: "collapse", width: "100%" }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left" }}>Title</th>
-                  <th style={{ textAlign: "left" }}>Due</th>
-                  <th style={{ textAlign: "left" }}>Weight</th>
-                  <th style={{ textAlign: "left" }}>Course</th>
-                  {/* NEW column header for PDF */}
-                  <th style={{ textAlign: "left" }}>Extra Rubrics</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i}>
-                    <td
-                      contentEditable
-                      suppressContentEditableWarning
-                      onBlur={(e) => (r.title = e.currentTarget.textContent || r.title)}
-                      style={{ borderBottom: "1px solid #ddd" }}
-                    >
-                      {r.title}
-                    </td>
-                    <td style={{ borderBottom: "1px solid #ddd" }}>
-                      {new Date(r.dueDate).toLocaleString()}
-                    </td>
-                    <td
-                      contentEditable
-                      suppressContentEditableWarning
-                      onBlur={(e) => {
-                        const v = e.currentTarget.textContent?.trim();
-                        r.weight = v ? Number(v) : undefined;
-                      }}
-                      style={{ borderBottom: "1px solid #ddd" }}
-                    >
-                      {r.weight ?? ""}
-                    </td>
-                    <td
-                      contentEditable
-                      suppressContentEditableWarning
-                      onBlur={(e) => (r.course = e.currentTarget.textContent || undefined)}
-                      style={{ borderBottom: "1px solid #ddd" }}
-                    >
-                      {r.course ?? ""}
-                    </td>
-                    {/* NEW cell: file input for PDF */}
-                    <td style={{ borderBottom: "1px solid #ddd" }}>
-                      <input
-                        type="file"
-                        accept=".pdf"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) {
-                            r.pdfName = file.name;
-                            // force update to re-render the table cell
-                            setRows((prev) => prev ? [...prev] : prev);
-                          }
-                        }}
-                      />
-                      {r.pdfName && <small>{r.pdfName}</small>}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-            <div style={{
+          <div
+            style={{
               display: 'inline-block',
               position: 'relative',
-              cursor: 'pointer'
-            }}>
-              <input
-                type="file"
-                accept={format === "ics" ? ".ics" : ".csv"}
-                onChange={handleFile}
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  opacity: 0,
-                  cursor: 'pointer'
-                }}
-              />
-              <div style={{
+              cursor: busy ? 'not-allowed' : 'pointer',
+              opacity: busy ? 0.8 : 1,
+              transition: 'opacity 0.2s ease'
+            }}
+          >
+            <input
+              type="file"
+              accept={format === "ics" ? ".ics" : ".csv"}
+              onChange={handleFile}
+              disabled={busy}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                opacity: 0,
+                cursor: busy ? 'not-allowed' : 'pointer'
+              }}
+            />
+            <div
+              style={{
                 background: busy ? '#f3f4f6' : '#4f46e5',
                 color: busy ? '#6b7280' : 'white',
                 padding: '1rem 2rem',
@@ -269,42 +206,54 @@ export default function Ingest() {
                 alignItems: 'center',
                 gap: '0.5rem',
                 transition: 'all 0.2s ease'
-              }}>
-                {busy ? (
-                  <>
-                    <div style={{
+              }}
+            >
+              {busy ? (
+                <>
+                  <div
+                    style={{
                       width: '16px',
                       height: '16px',
                       border: '2px solid #d1d5db',
                       borderTop: '2px solid #6b7280',
                       borderRadius: '50%',
                       animation: 'spin 1s linear infinite'
-                    }}></div>
-                    Parsing file...
-                  </>
-                ) : (
-                  <>
-                    📤 Choose {format.toUpperCase()} File
-                  </>
-                )}
-              </div>
+                    }}
+                  ></div>
+                  Parsing file...
+                </>
+              ) : (
+                <>📤 Choose {format.toUpperCase()} File</>
+              )}
             </div>
-
-            <p style={{ 
-              marginTop: '1rem', 
-              color: '#64748b',
-              fontSize: '0.9rem'
-            }}>
-              {format === "ics" 
-                ? "Upload a calendar file (.ics) exported from your academic calendar"
-                : "Upload a CSV file with columns: title, dueDate, weight, course, notes"
-              }
-            </p>
           </div>
 
-          {rows && (
-            <div style={{ marginTop: '2rem' }}>
-              <div style={{
+          <p
+            style={{
+              marginTop: '1rem',
+              color: '#64748b',
+              fontSize: '0.9rem'
+            }}
+          >
+            {format === "ics"
+              ? "Upload a calendar file (.ics) exported from your academic calendar"
+              : "Upload a CSV file with columns: title, dueDate, weight, course, notes"}
+          </p>
+        </div>
+
+        {rows && (
+          <div style={{ marginTop: '2rem' }}>
+            <h3
+              style={{
+                margin: '0 0 1.25rem 0',
+                color: '#111827',
+                fontSize: '1.25rem',
+                fontWeight: 600
+              }}
+            >
+              Review & Confirm
+            </h3>
+            <div style={{
                 display: 'flex',
                 alignItems: 'center',
                 gap: '0.75rem',
@@ -385,6 +334,15 @@ export default function Ingest() {
                         }}>
                           🎓 Course
                         </th>
+                        <th style={{ 
+                          textAlign: "left",
+                          padding: '1rem',
+                          fontWeight: '600',
+                          color: '#374151',
+                          borderBottom: '2px solid #e5e7eb'
+                        }}>
+                          📎 Extra Rubrics
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
@@ -447,12 +405,43 @@ export default function Ingest() {
                             onBlur={(e) => (r.course = e.currentTarget.textContent || undefined)}
                             style={{ 
                               padding: '1rem',
+                              borderRight: '1px solid #f3f4f6',
                               cursor: 'text',
                               color: '#374151',
                               fontWeight: '500'
                             }}
                           >
                             {r.course ?? ""}
+                          </td>
+                          <td
+                            style={{
+                              padding: '1rem',
+                              minWidth: '220px',
+                              color: '#374151',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'flex-start',
+                              gap: '0.5rem'
+                            }}
+                          >
+                            <input
+                              type="file"
+                              accept=".pdf"
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                  r.pdfName = file.name;
+                                  setRows((prev) => (prev ? [...prev] : prev));
+                                }
+                                e.target.value = "";
+                              }}
+                              style={{
+                                fontSize: '0.9rem'
+                              }}
+                            />
+                            {r.pdfName && (
+                              <small style={{ color: '#6b7280' }}>{r.pdfName}</small>
+                            )}
                           </td>
                         </tr>
                       ))}
