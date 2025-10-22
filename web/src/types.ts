@@ -1,0 +1,100 @@
+export type Assessment = {
+  title: string;
+  dueDate: string;
+  weight?: number;
+  course?: string;
+  notes?: string;
+  pdfName?: string;
+};
+
+export type Milestone = {
+  title: string;
+  targetDate: string;
+  estimateHrs?: number;
+  assessmentTitle: string;
+  assessmentDueDate?: string;
+};
+
+export type PlannerPreferences = {
+  dailyCapHours: number;
+  minSessionMinutes: number;
+  maxSessionMinutes: number;
+  focusBlockMinutes: number;
+  allowWeekends: boolean;
+  startHour: number;
+  endHour: number;
+};
+
+export type SessionStatus = "pending" | "complete";
+export type RiskLevel = "on-track" | "warning" | "at-risk";
+
+export type PlannedSession = {
+  id: string;
+  assessmentTitle: string;
+  assessmentDueDate: string;
+  milestoneTitle: string;
+  subtaskTitle: string;
+  date: string;          // YYYY-MM-DD
+  startTime: string;     // HH:mm
+  endTime: string;       // HH:mm
+  durationHours: number;
+  status: SessionStatus;
+  notes?: string;
+  riskLevel: RiskLevel;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  blockedBy?: string;
+  rolledFromDate?: string;
+};
+
+export type PlanWarningType = "capacity" | "deadline" | "conflict" | "info";
+
+export type PlanWarning = {
+  type: PlanWarningType;
+  message: string;
+  detail?: string;
+};
+
+export type DaySummary = {
+  date: string;
+  isWeekend: boolean;
+  capacity: number;
+  totalHours: number;
+  sessions: PlannedSession[];
+};
+
+export type PlanResult = {
+  sessions: PlannedSession[];
+  days: DaySummary[];
+  warnings: PlanWarning[];
+  unplaced: PlannedSession[];
+  version: number;
+};
+
+export type NotificationSeverity = "info" | "warning" | "urgent";
+
+export type NotificationItem = {
+  id: string;
+  title: string;
+  message: string;
+  dueDate: string;
+  sessionId?: string;
+  severity: NotificationSeverity;
+  createdAt: string;
+};
+
+export type NotificationState = {
+  id: string;
+  dismissedAt?: string;
+  snoozedUntil?: string;
+};
+
+export type WeeklyProgress = {
+  weekLabel: string;
+  startDate: string;
+  endDate: string;
+  plannedHours: number;
+  completedHours: number;
+  status: "on-track" | "behind" | "at-risk";
+};
