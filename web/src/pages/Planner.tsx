@@ -68,43 +68,6 @@ function toPlannedSession(s: any, version: number): PlannedSession {
   };
 }
 
-function startOfDay(d: Date) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
-function addDays(d: Date, n: number) {
-  const x = new Date(d);
-  x.setDate(x.getDate() + n);
-  return x;
-}
-function toIsoDate(d: Date) {
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
-    .toISOString()
-    .slice(0, 10);
-}
-
-// Monday as start of week
-function startOfWeekMonday(d = new Date()): Date {
-  const x = startOfDay(d);
-  const day = x.getDay(); // 0 Sun … 6 Sat
-  const diff = day === 0 ? -6 : 1 - day; // if Sun, go back 6; else 1-day
-  return addDays(x, diff);
-}
-
-function formatRangeCaption(dates: Date[]) {
-  const opts: Intl.DateTimeFormatOptions = {
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-  };
-  const first = dates[0].toLocaleDateString("en-AU", opts);
-  const last = dates[6].toLocaleDateString("en-AU", opts);
-  return `${first} – ${last}`;
-}
-
-const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
 // Map "is this done?" and "set done" in a typed-safe way
 const isDone = (status?: SessionStatus) =>
   status === ("completed" as SessionStatus) || status === ("done" as any); // allow legacy "done" if it sneaks in
@@ -130,10 +93,48 @@ const shortDate = (isoDate: string) =>
     timeZone: "Australia/Sydney",
   });
 
-// --- compute a simple 7-day window from a start index into plan.days ---
-function sliceWeek(days: PlanResult["days"], startIndex: number) {
-  return days.slice(startIndex, startIndex + 7);
+// --- week/date helpers for a fixed Mon→Sun 7-column calendar ---
+function startOfDay(d: Date) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
 }
+
+function addDays(d: Date, n: number) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+/** ISO local date yyyy-mm-dd (stable regardless of timezone) */
+function toIsoDate(d: Date) {
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/** Monday as the start of week for the given date */
+function startOfWeekMonday(d: Date = new Date()): Date {
+  const x = startOfDay(d);
+  const day = x.getDay(); // 0 Sun … 6 Sat
+  const diff = day === 0 ? -6 : 1 - day; // if Sun, go back 6; else back to Mon
+  return addDays(x, diff);
+}
+
+/** e.g., "Mon 10 Nov – Sun 16 Nov" */
+function formatRangeCaption(dates: Date[]): string {
+  const opts: Intl.DateTimeFormatOptions = {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  };
+
+  const first = dates[0].toLocaleDateString("en-AU", opts);
+  const last = dates[6].toLocaleDateString("en-AU", opts);
+  return `${first} – ${last}`;
+}
+
+const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 // --- risk pill UI color ---
 function riskColors(risk: PlannedSession["riskLevel"]) {
@@ -389,10 +390,30 @@ export default function Planner() {
     );
   }
 
-  // Calendar slice for current week pane
-  const weekDays = plan ? sliceWeek(plan.days, weekStartIndex) : [];
-  const canPrev = plan ? weekStartIndex > 0 : false;
-  const canNext = plan ? weekStartIndex + 7 < plan.days.length : false;
+  // --- Build a fixed 7-day (Mon→Sun) week view, paged in 7-day steps ---
+  const baseMonday = startOfWeekMonday(new Date()); // current week’s Monday
+  const weekStart = addDays(baseMonday, weekStartIndex); // move by ±7 via Prev/Next
+  const weekDates = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const weekIso = weekDates.map(toIsoDate);
+  const rangeTitle = formatRangeCaption(weekDates);
+
+  // Map the 7 dates to DaySummary: if plan has a day, use it; else create an empty shell
+  const findByDate = (iso: string) => plan?.days.find((d) => d.date === iso);
+  const weekDays: PlanResult["days"] = weekIso.map((iso, i) => {
+    const found = findByDate(iso);
+    if (found) return found;
+    return {
+      date: iso,
+      isWeekend: i >= 5, // Sat=5, Sun=6
+      capacity: 0,
+      totalHours: 0,
+      sessions: [],
+    };
+  });
+
+  // Paging guards
+  const canPrev = weekStartIndex > 0;
+  const canNext = true; // allow paging forward; tighten if you want
 
   return (
     <div
@@ -709,6 +730,9 @@ export default function Planner() {
                   ? `Version ${plan.version} • ${plan.sessions.length} sessions`
                   : "No preview yet"}
               </div>
+              <div style={{ color: "#334155", fontWeight: 600, marginTop: 6 }}>
+                {rangeTitle}
+              </div>
             </div>
             <div style={{ display: "flex", gap: "0.5rem" }}>
               <button
@@ -741,13 +765,15 @@ export default function Planner() {
                   marginTop: "0.75rem",
                 }}
               >
-                {weekDays.map((day) => (
-                  <DayColumn
-                    key={day.date}
-                    day={day}
-                    onToggleDone={toggleDone}
-                  />
-                ))}
+                {weekDays.map(
+                  (day: PlanResult["days"][number], idx: number) => (
+                    <DayColumn
+                      key={day.date}
+                      day={day}
+                      onToggleDone={toggleDone}
+                    />
+                  )
+                )}
               </div>
 
               {/* Unplaced */}
