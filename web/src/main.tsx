@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import Login from "./pages/Login";
+import SignUp from "./pages/SignUp";
 import Ingest from "./pages/Ingest";
 import Milestones from "./pages/Milestones";
 import AuthGate from "./components/AuthGate";
@@ -19,6 +20,7 @@ function Shell({ children }: { children: React.ReactNode }) {
 
 const router = createBrowserRouter([
   { path: "/login", element: <Login /> },
+  { path: "/signup", element: <SignUp /> },
   {
     path: "/ingest",
     element: (

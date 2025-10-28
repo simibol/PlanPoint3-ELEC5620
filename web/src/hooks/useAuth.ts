@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { onAuthStateChanged, User } from "firebase/auth";
+import { onAuthStateChanged, User, signOut as firebaseSignOut } from "firebase/auth";
 import { auth } from "../firebase";
 
 export function useAuth() {
@@ -11,5 +11,18 @@ export function useAuth() {
     setLoading(false);
   }), []);
 
-  return { user, loading };
+  const signOut = async () => {
+    try {
+      await firebaseSignOut(auth);
+    } catch (error) {
+      console.error("Sign out error:", error);
+    }
+  };
+
+  return { 
+    user, 
+    loading, 
+    signOut,
+    isAuthenticated: !!user 
+  };
 }
