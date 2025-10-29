@@ -4,9 +4,9 @@ export type Assessment = {
   weight?: number;
   course?: string;
   notes?: string;
-  pdfName?: string;
+  specUrl?: string;
+  specPath?: string;
 };
-
 export type Milestone = {
   title: string;
   targetDate: string;
@@ -25,14 +25,9 @@ export type PlannerPreferences = {
   endHour: number;
 };
 
-export type SessionStatus =
-  | "planned"
-  | "in-progress"
-  | "completed"
-  | "todo"; // include the two you actually plan to use
+export type SessionStatus = "planned" | "in-progress" | "completed" | "todo"; // include the two you actually plan to use
 
-  export type RiskLevel = "on-track" | "warning" | "late" | "at-risk"; // include "late" and "at-risk"
-
+export type RiskLevel = "on-track" | "warning" | "late" | "at-risk"; // include "late" and "at-risk"
 
 export type PlannedSession = {
   id: string;
