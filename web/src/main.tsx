@@ -5,6 +5,9 @@ import Login from "./pages/Login";
 import SignUp from "./pages/SignUp";
 import Ingest from "./pages/Ingest";
 import Milestones from "./pages/Milestones";
+import Planner from "./pages/Planner";
+import Progress from "./pages/Progress";
+import Notifications from "./pages/Notifications";
 import AuthGate from "./components/AuthGate";
 import Header from "./components/Header";
 import "./index.css";
@@ -26,6 +29,30 @@ const router = createBrowserRouter([
     element: (
       <AuthGate>
         <Shell><Ingest /></Shell>
+      </AuthGate>
+    ),
+  },
+  {
+    path: "/planner",
+    element: (
+      <AuthGate>
+        <Shell><Planner /></Shell>
+      </AuthGate>
+    ),
+  },
+  {
+    path: "/progress",
+    element: (
+      <AuthGate>
+        <Shell><Progress /></Shell>
+      </AuthGate>
+    ),
+  },
+  {
+    path: "/notifications",
+    element: (
+      <AuthGate>
+        <Shell><Notifications /></Shell>
       </AuthGate>
     ),
   },

@@ -1,9 +1,7 @@
 import { useEffect, useState } from "react";
 import { auth, db } from "../firebase";
 import { collection, getDocs, doc, setDoc } from "firebase/firestore";
-
-type Assessment = { title: string; dueDate: string; weight?: number; course?: string; notes?: string };
-type Milestone = { title: string; targetDate: string; estimateHrs?: number; assessmentTitle: string };
+import type { Assessment, Milestone } from "../types";
 
 type MilestonesResponse = {
   milestones: Milestone[];
@@ -11,22 +9,65 @@ type MilestonesResponse = {
   error?: string;
 };
 
+const makeAssessmentKey = (title: string, dueDate?: string) =>
+  `${title.trim().toLowerCase()}|${dueDate ? new Date(dueDate).toISOString() : ""}`;
+
 export default function Milestones() {
   const [assessments, setAssessments] = useState<Assessment[]>([]);
   const [selected, setSelected] = useState<Assessment | null>(null);
   const [draft, setDraft] = useState<Milestone[] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [generatedFor, setGeneratedFor] = useState<Set<string>>(new Set());
   const uid = auth.currentUser?.uid;
 
   useEffect(() => {
+    if (!uid) {
+      setAssessments([]);
+      setGeneratedFor(new Set<string>());
+      return;
+    }
+
+    let cancelled = false;
+
     (async () => {
-      if (!uid) return;
-      const snap = await getDocs(collection(db, "users", uid, "assessments"));
-      setAssessments(snap.docs.map((d) => d.data() as Assessment));
+      try {
+        const [assessmentsSnap, milestonesSnap] = await Promise.all([
+          getDocs(collection(db, "users", uid, "assessments")),
+          getDocs(collection(db, "users", uid, "milestones")),
+        ]);
+        if (cancelled) return;
+
+        setAssessments(assessmentsSnap.docs.map((d) => d.data() as Assessment));
+
+        const next = new Set<string>();
+        milestonesSnap.forEach((docSnap) => {
+          const data = docSnap.data() as Milestone;
+          if (data.assessmentTitle) {
+            next.add(makeAssessmentKey(data.assessmentTitle, data.assessmentDueDate));
+          }
+        });
+        setGeneratedFor(next);
+      } catch (error) {
+        console.error("[Milestones] failed to load data", error);
+      }
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [uid]);
 
   async function generate(a: Assessment) {
+    const assessmentKey = makeAssessmentKey(a.title, a.dueDate);
+    if (generatedFor.has(assessmentKey)) {
+      alert("Milestones have already been generated for this assessment.");
+      return;
+    }
+    if (draft && selected && makeAssessmentKey(selected.title, selected.dueDate) === assessmentKey) {
+      alert("Milestones already generated for this assessment. Save or cancel them before regenerating.");
+      return;
+    }
+
     setSelected(a);
     setBusy(true);
     try {
@@ -42,7 +83,12 @@ export default function Milestones() {
       const data = (await res.json()) as MilestonesResponse;   // <-- assert
       if (!data.milestones) throw new Error(data.error || "Bad response");
 
-      setDraft(data.milestones);
+      const sanitized = data.milestones.map((m) => ({
+        ...m,
+        assessmentTitle: m.assessmentTitle ?? a.title,
+        assessmentDueDate: m.assessmentDueDate ?? a.dueDate,
+      }));
+      setDraft(sanitized);
     } catch (e: any) {
       alert(e.message || "Failed to generate");
     } finally {
@@ -53,7 +99,27 @@ export default function Milestones() {
   async function saveAll() {
     if (!uid || !draft?.length) return;
     const col = collection(db, "users", uid, "milestones");
-    await Promise.all(draft.map((m) => setDoc(doc(col), m)));
+    const selectedAssessment = selected;
+    await Promise.all(
+      draft.map((m) =>
+        setDoc(
+          doc(col),
+          {
+            ...m,
+            assessmentTitle: selectedAssessment?.title ?? m.assessmentTitle,
+            assessmentDueDate: selectedAssessment?.dueDate ?? m.assessmentDueDate,
+          }
+        )
+      )
+    );
+    if (selectedAssessment) {
+      const key = makeAssessmentKey(selectedAssessment.title, selectedAssessment.dueDate);
+      setGeneratedFor((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+    }
     alert("Milestones saved!");
     setDraft(null);
     setSelected(null);
@@ -167,6 +233,8 @@ export default function Milestones() {
                   const days = getDaysUntilDue(a.dueDate);
                   const priority = getPriorityColor(a.dueDate);
                   const isGenerating = busy && selected?.title === a.title;
+                  const alreadyGenerated = generatedFor.has(makeAssessmentKey(a.title, a.dueDate));
+                  const buttonDisabled = busy || alreadyGenerated;
                   
                   return (
                     <div 
@@ -254,17 +322,21 @@ export default function Milestones() {
 
                         <button 
                           onClick={() => generate(a)} 
-                          disabled={busy}
+                          disabled={buttonDisabled}
                           style={{
-                            background: isGenerating ? '#f3f4f6' : 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)',
-                            color: isGenerating ? '#6b7280' : 'white',
+                            background: alreadyGenerated
+                              ? '#e5e7eb'
+                              : isGenerating
+                                ? '#f3f4f6'
+                                : 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)',
+                            color: alreadyGenerated || isGenerating ? '#6b7280' : 'white',
                             border: 'none',
                             borderRadius: '8px',
                             padding: '0.75rem 1.5rem',
                             fontSize: '0.9rem',
                             fontWeight: '600',
-                            cursor: busy ? 'not-allowed' : 'pointer',
-                            boxShadow: isGenerating ? 'none' : '0 4px 12px rgba(79, 70, 229, 0.3)',
+                            cursor: buttonDisabled ? 'not-allowed' : 'pointer',
+                            boxShadow: alreadyGenerated || isGenerating ? 'none' : '0 4px 12px rgba(79, 70, 229, 0.3)',
                             transition: 'all 0.2s ease',
                             display: 'flex',
                             alignItems: 'center',
@@ -272,7 +344,9 @@ export default function Milestones() {
                             whiteSpace: 'nowrap'
                           }}
                         >
-                          {isGenerating ? (
+                          {alreadyGenerated ? (
+                            <>✅ Already Generated</>
+                          ) : isGenerating ? (
                             <>
                               <div style={{
                                 width: '16px',

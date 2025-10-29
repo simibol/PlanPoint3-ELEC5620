@@ -16,6 +16,9 @@ export default function App() {
       <nav style={{ display: "flex", gap: 12 }}>
         <Link to="/ingest">Upload Schedule (UC1)</Link>
         <Link to="/milestones">Milestones (UC2)</Link>
+        <Link to="/planner">Auto Planner (UC3)</Link>
+        <Link to="/progress">Progress Tracker (UC4)</Link>
+        <Link to="/notifications">Notifications (UC5)</Link>
       </nav>
     </div>
   );
