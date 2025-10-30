@@ -6,6 +6,12 @@ export type Assessment = {
   notes?: string;
   specUrl?: string;
   specPath?: string;
+  specName?: string;
+  specText?: string;
+  rubricUrl?: string;
+  rubricPath?: string;
+  rubricName?: string;
+  rubricText?: string;
 };
 export type Milestone = {
   title: string;
