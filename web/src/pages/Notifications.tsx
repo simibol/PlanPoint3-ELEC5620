@@ -7,6 +7,7 @@ import type {
   NotificationState,
   PlannedSession,
   PlannerPreferences,
+  SessionStatus,
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
@@ -15,6 +16,15 @@ import {
 } from "../lib/planner";
 
 const parseDate = (iso: string) => new Date(`${iso}T00:00:00`);
+
+const normaliseStatus = (status: string | undefined): SessionStatus => {
+  if (!status) return "planned";
+  const lower = status.toLowerCase();
+  if (lower === "complete" || lower === "completed") return "completed";
+  if (lower === "in-progress") return "in-progress";
+  if (lower === "todo") return "todo";
+  return "planned";
+};
 
 const severityStyles: Record<
   NotificationItem["severity"],
@@ -51,7 +61,11 @@ export default function Notifications() {
         ]);
 
         const fetchedSessions = planSnap.docs
-          .map((d) => ({ ...(d.data() as PlannedSession), id: d.id }))
+          .map((d) => {
+            const data = d.data() as PlannedSession;
+            const status = normaliseStatus((data as any).status);
+            return { ...data, id: d.id, status };
+          })
           .sort((a, b) => {
             const dateDiff =
               parseDate(a.date).getTime() - parseDate(b.date).getTime();
@@ -141,13 +155,13 @@ export default function Notifications() {
       const ref = doc(db, "users", uid, "planSessions", notification.sessionId);
       await setDoc(
         ref,
-        { status: "complete", updatedAt: new Date().toISOString() },
+        { status: "completed", updatedAt: new Date().toISOString() },
         { merge: true }
       );
       setSessions((prev) =>
         prev.map((session) =>
           session.id === notification.sessionId
-            ? { ...session, status: "complete" }
+            ? { ...session, status: "completed" }
             : session
         )
       );
@@ -372,7 +386,7 @@ export default function Notifications() {
                         marginTop: "0.75rem",
                       }}
                     >
-                      {session && session.status !== "complete" && (
+                      {session && session.status !== "completed" && (
                         <button
                           onClick={() => markSessionComplete(notification)}
                           style={buttonStyle(style.text)}

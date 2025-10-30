@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   collection,
+  addDoc,
   doc,
   getDoc,
   getDocs,
@@ -13,6 +15,9 @@ import type {
   PlannedSession,
   PlanResult,
   WeeklyProgress,
+  BusyBlock,
+  SessionStatus,
+  ProgressAudit,
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
@@ -42,16 +47,54 @@ const formatFullDate = (isoDate: string) =>
 const formatTimeRange = (session: PlannedSession) =>
   `${session.startTime} – ${session.endTime}`;
 
+const normaliseStatus = (status: string | undefined): SessionStatus => {
+  if (!status) return "planned";
+  const lower = status.toLowerCase();
+  if (lower === "complete" || lower === "completed") return "completed";
+  if (lower === "in-progress") return "in-progress";
+  if (lower === "todo") return "todo";
+  return "planned";
+};
+
+const progressLabel = (ratio: number): "on-track" | "behind" | "at-risk" => {
+  if (ratio >= 0.85) return "on-track";
+  if (ratio >= 0.55) return "behind";
+  return "at-risk";
+};
+
+const clampPercent = (value: number) =>
+  Math.max(0, Math.min(100, Math.round(value)));
+
+const toIsoString = (value: any) => {
+  if (!value) return new Date().toISOString();
+  if (typeof value === "string") return value;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value.toDate === "function") {
+    try {
+      return value.toDate().toISOString();
+    } catch (err) {
+      // fall through to default below
+    }
+  }
+  return new Date().toISOString();
+};
+
 export default function Progress() {
   const uid = auth.currentUser?.uid;
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [autoCatchupRequested, setAutoCatchupRequested] = useState(
+    () => searchParams.get("catchup") === "1"
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PlannedSession[]>([]);
+  const [busyBlocks, setBusyBlocks] = useState<BusyBlock[]>([]);
   const [preferences, setPreferences] =
     useState<PlannerPreferences>(DEFAULT_PREFERENCES);
   const [rescheduleContext, setRescheduleContext] =
     useState<RescheduleContext | null>(null);
+  const [auditEntries, setAuditEntries] = useState<ProgressAudit[]>([]);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -62,14 +105,19 @@ export default function Progress() {
       try {
         const planCol = collection(db, "users", uid, "planSessions");
         const prefsDoc = doc(db, "users", uid, "settings", "planner");
-        const [planSnap, prefSnap] = await Promise.all([
+        const busyCol = collection(db, "users", uid, "busy");
+        const auditCol = collection(db, "users", uid, "progressAudit");
+        const [planSnap, prefSnap, busySnap, auditSnap] = await Promise.all([
           getDocs(planCol),
           getDoc(prefsDoc),
+          getDocs(busyCol),
+          getDocs(auditCol),
         ]);
         const fetched = planSnap.docs
           .map((d) => {
             const data = d.data() as PlannedSession;
-            return { ...data, id: d.id };
+            const status = normaliseStatus((data as any).status);
+            return { ...data, id: d.id, status };
           })
           .sort((a, b) => {
             const dateDiff =
@@ -78,6 +126,22 @@ export default function Progress() {
             return a.startTime.localeCompare(b.startTime);
           });
         setSessions(fetched);
+        setBusyBlocks(busySnap.docs.map((d) => d.data() as BusyBlock));
+        const audits = auditSnap.docs
+          .map((d) => {
+            const data = d.data() as ProgressAudit;
+            return {
+              ...data,
+              id: d.id,
+              createdAt: toIsoString((data as any)?.createdAt),
+            };
+          })
+          .sort(
+            (a, b) =>
+              new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          )
+          .slice(0, 25);
+        setAuditEntries(audits);
 
         if (prefSnap.exists()) {
           setPreferences(withDefaults(prefSnap.data() as PlannerPreferences));
@@ -92,6 +156,24 @@ export default function Progress() {
       }
     })();
   }, [uid]);
+
+  const recordAudit = useCallback(
+    async (entry: Omit<ProgressAudit, "id">) => {
+      if (!uid) return;
+      try {
+        const docRef = await addDoc(
+          collection(db, "users", uid, "progressAudit"),
+          entry
+        );
+        setAuditEntries((prev) =>
+          [{ ...entry, id: docRef.id }, ...prev].slice(0, 25)
+        );
+      } catch (err) {
+        console.error("[Progress] audit record failed:", err);
+      }
+    },
+    [uid]
+  );
 
   const now = new Date();
   now.setSeconds(0, 0);
@@ -120,33 +202,68 @@ export default function Progress() {
     () =>
       sessions.filter(
         (session) =>
-          session.status !== "complete" &&
+          session.status !== "completed" &&
           parseDate(session.date).getTime() < todayKey.getTime()
       ),
     [sessions, todayKey]
   );
 
-  const progressPercent = (() => {
-    const total = currentWeekSessions.reduce(
-      (acc, s) => acc + s.durationHours,
+  const weeklyTotals = useMemo(() => {
+    const planned = currentWeekSessions.reduce(
+      (acc, session) => acc + session.durationHours,
       0
     );
-    const done = currentWeekSessions
-      .filter((s) => s.status === "complete")
-      .reduce((acc, s) => acc + s.durationHours, 0);
-    return total > 0 ? Math.round((done / total) * 100) : 100;
-  })();
+    const completed = currentWeekSessions
+      .filter((session) => session.status === "completed")
+      .reduce((acc, session) => acc + session.durationHours, 0);
+    return { planned, completed };
+  }, [currentWeekSessions]);
+
+  const overallTotals = useMemo(() => {
+    const planned = sessions.reduce(
+      (acc, session) => acc + session.durationHours,
+      0
+    );
+    const completed = sessions
+      .filter((session) => session.status === "completed")
+      .reduce((acc, session) => acc + session.durationHours, 0);
+    return { planned, completed };
+  }, [sessions]);
+
+  const progressPercent = clampPercent(
+    weeklyTotals.planned > 0
+      ? (weeklyTotals.completed / weeklyTotals.planned) * 100
+      : 100
+  );
+  const weeklyStatus = progressLabel(
+    weeklyTotals.planned > 0
+      ? weeklyTotals.completed / weeklyTotals.planned
+      : 1
+  );
+
+  const semesterPercent = clampPercent(
+    overallTotals.planned > 0
+      ? (overallTotals.completed / overallTotals.planned) * 100
+      : 100
+  );
+  const semesterStatus = progressLabel(
+    overallTotals.planned > 0
+      ? overallTotals.completed / overallTotals.planned
+      : 1
+  );
 
   const toggleStatus = async (session: PlannedSession) => {
     if (!uid) return;
-    const newStatus = session.status === "complete" ? "pending" : "complete";
+    const wasCompleted = session.status === "completed";
+    const newStatus: SessionStatus = wasCompleted ? "planned" : "completed";
+    const timestamp = new Date().toISOString();
     try {
       const ref = doc(db, "users", uid, "planSessions", session.id);
       await setDoc(
         ref,
         {
           status: newStatus,
-          updatedAt: new Date().toISOString(),
+          updatedAt: timestamp,
         },
         { merge: true }
       );
@@ -155,15 +272,25 @@ export default function Progress() {
           item.id === session.id ? { ...item, status: newStatus } : item
         )
       );
+      await recordAudit({
+        action: "status-change",
+        sessionId: session.id,
+        sessionTitle: session.subtaskTitle,
+        assessmentTitle: session.assessmentTitle,
+        beforeStatus: session.status,
+        afterStatus: newStatus,
+        note: wasCompleted ? "Marked incomplete" : "Marked complete",
+        createdAt: timestamp,
+      });
     } catch (err: any) {
       console.error("[Progress] toggle failed:", err);
       setError(err.message || "Unable to update session status.");
     }
   };
 
-  const prepareRollForward = () => {
+  const prepareRollForward = useCallback(() => {
     const candidates = currentWeekSessions.filter(
-      (session) => session.status !== "complete"
+      (session) => session.status !== "completed"
     );
     if (!candidates.length) {
       setSuccess("Nothing to roll—current week is up to date.");
@@ -171,28 +298,40 @@ export default function Progress() {
     }
     const plan = rescheduleSessions(candidates, preferences, {
       startDate: nextWeekStart,
+      busyBlocks,
     });
     setRescheduleContext({
       label: "Next-week rollover",
       plan,
       original: new Map(candidates.map((s) => [s.id, s])),
     });
-  };
+  }, [currentWeekSessions, preferences, nextWeekStart, busyBlocks, setSuccess, setRescheduleContext]);
 
-  const prepareCatchUp = () => {
+  const prepareCatchUp = useCallback(() => {
     if (!overdueSessions.length) {
       setSuccess("Great work—no overdue sessions detected.");
       return;
     }
     const plan = rescheduleSessions(overdueSessions, preferences, {
       startDate: todayKey,
+      busyBlocks,
     });
     setRescheduleContext({
       label: "Catch-up reschedule",
       plan,
       original: new Map(overdueSessions.map((s) => [s.id, s])),
     });
-  };
+  }, [overdueSessions, preferences, todayKey, busyBlocks, setSuccess, setRescheduleContext]);
+
+  useEffect(() => {
+    if (!autoCatchupRequested) return;
+    if (loading) return;
+    const params = new URLSearchParams(searchParams);
+    params.delete("catchup");
+    setSearchParams(params, { replace: true });
+    prepareCatchUp();
+    setAutoCatchupRequested(false);
+  }, [autoCatchupRequested, loading, searchParams, setSearchParams, prepareCatchUp]);
 
   const applyReschedule = async () => {
     if (!uid || !rescheduleContext) return;
@@ -211,8 +350,10 @@ export default function Progress() {
 
       plan.sessions.forEach((session) => {
         const prior = original.get(session.id);
+        const normalisedStatus = normaliseStatus((session as any).status);
         const update: PlannedSession = {
           ...session,
+          status: normalisedStatus,
           rolledFromDate: prior?.rolledFromDate ?? prior?.date ?? session.rolledFromDate,
           updatedAt: timestamp,
         };
@@ -225,14 +366,23 @@ export default function Progress() {
           const updated = plan.sessions.find((s) => s.id === existing.id);
           if (!updated) return existing;
           const prior = original.get(existing.id);
+          const normalisedStatus = normaliseStatus((updated as any).status);
           return {
             ...existing,
             ...updated,
+            status: normalisedStatus,
             rolledFromDate:
               prior?.rolledFromDate ?? prior?.date ?? existing.rolledFromDate,
           };
         })
       );
+      await recordAudit({
+        action: "reschedule",
+        createdAt: timestamp,
+        note: `${rescheduleContext.label} (${plan.sessions.length} session${
+          plan.sessions.length === 1 ? "" : "s"
+        }) applied`,
+      });
       setSuccess(`${rescheduleContext.label} applied.`);
       setRescheduleContext(null);
     } catch (err: any) {
@@ -248,11 +398,31 @@ export default function Progress() {
       "Week Start,Week End,Planned Hours,Completed Hours,Status",
       ...summaries.map(
         (summary) =>
-          `${formatDate(summary.startDate)},${formatDate(summary.endDate)},${summary.plannedHours.toFixed(
-            1
-          )},${summary.completedHours.toFixed(1)},${summary.status}`
+          [
+            csvSafe(formatDate(summary.startDate)),
+            csvSafe(formatDate(summary.endDate)),
+            csvSafe(summary.plannedHours.toFixed(1)),
+            csvSafe(summary.completedHours.toFixed(1)),
+            csvSafe(summary.status),
+          ].join(",")
       ),
     ];
+    if (auditEntries.length) {
+      lines.push("", "Audit Trail", "Timestamp,Action,Session,Assessment,Before Status,After Status,Note");
+      auditEntries.forEach((entry) => {
+        lines.push(
+          [
+            csvSafe(entry.createdAt),
+            csvSafe(entry.action),
+            csvSafe(entry.sessionTitle ?? "-"),
+            csvSafe(entry.assessmentTitle ?? "-"),
+            csvSafe(entry.beforeStatus ?? "-"),
+            csvSafe(entry.afterStatus ?? "-"),
+            csvSafe(entry.note ?? "-"),
+          ].join(",")
+        );
+      });
+    }
     const blob = new Blob([lines.join("\n")], {
       type: "text/csv;charset=utf-8;",
     });
@@ -370,7 +540,30 @@ export default function Progress() {
             <MetricTile
               label="Current week progress"
               value={`${progressPercent}%`}
-              helper={`${currentWeekSessions.filter((s) => s.status === "complete").length} of ${currentWeekSessions.length} sessions`}
+              helper={`${currentWeekSessions.filter((s) => s.status === "completed").length} of ${currentWeekSessions.length} sessions`}
+            />
+          </div>
+          <div
+            style={{
+              marginTop: "1.25rem",
+              display: "grid",
+              gap: "1rem",
+              gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+            }}
+          >
+            <ProgressBarSummary
+              label="Weekly completion"
+              percent={progressPercent}
+              status={weeklyStatus}
+              completed={weeklyTotals.completed}
+              planned={weeklyTotals.planned}
+            />
+            <ProgressBarSummary
+              label="Semester completion"
+              percent={semesterPercent}
+              status={semesterStatus}
+              completed={overallTotals.completed}
+              planned={overallTotals.planned}
             />
           </div>
         </header>
@@ -454,7 +647,7 @@ export default function Progress() {
             {!currentWeekSessions.length ? (
               <p style={{ color: "#475569" }}>
                 No sessions scheduled this week. Run the planner to populate new
-                blocks.
+                blocks via the <a href="/planner" style={{ color: "#0f766e", fontWeight: 600 }}>Auto Planner</a>.
               </p>
             ) : (
               <div style={{ display: "grid", gap: "1rem" }}>
@@ -469,12 +662,12 @@ export default function Progress() {
                       gap: "1rem",
                       alignItems: "flex-start",
                       background:
-                        session.status === "complete" ? "#ecfdf5" : "white",
+                        session.status === "completed" ? "#ecfdf5" : "white",
                     }}
                   >
                     <input
                       type="checkbox"
-                      checked={session.status === "complete"}
+                      checked={session.status === "completed"}
                       onChange={() => toggleStatus(session)}
                       style={{ marginTop: "0.4rem" }}
                     />
@@ -556,6 +749,19 @@ export default function Progress() {
                 {overdueSessions.length} overdue session
                 {overdueSessions.length === 1 ? "" : "s"} detected. Consider running the catch-up.
               </p>
+            )}
+          </section>
+
+          <section style={{ marginBottom: "2.5rem" }}>
+            <h2 style={{ margin: "0 0 1rem 0", color: "#0f172a" }}>
+              Recent audit trail
+            </h2>
+            {!auditEntries.length ? (
+              <p style={{ color: "#475569" }}>
+                No tracked actions yet. As you mark tasks complete or reschedule, entries will appear here.
+              </p>
+            ) : (
+              <AuditTrail entries={auditEntries.slice(0, 8)} />
             )}
           </section>
 
@@ -759,6 +965,99 @@ export default function Progress() {
   );
 }
 
+const STATUS_COLORS: Record<"on-track" | "behind" | "at-risk", { pillBg: string; pillText: string; bar: string }> = {
+  "on-track": { pillBg: "#dcfce7", pillText: "#166534", bar: "#16a34a" },
+  behind: { pillBg: "#fef3c7", pillText: "#92400e", bar: "#f97316" },
+  "at-risk": { pillBg: "#fee2e2", pillText: "#b91c1c", bar: "#ef4444" },
+};
+
+function ProgressBarSummary({
+  label,
+  percent,
+  status,
+  completed,
+  planned,
+}: {
+  label: string;
+  percent: number;
+  status: "on-track" | "behind" | "at-risk";
+  completed: number;
+  planned: number;
+}) {
+  const palette = STATUS_COLORS[status];
+  const safePercent = Math.min(Math.max(percent, 0), 100);
+  return (
+    <div
+      style={{
+        padding: "1rem 1.25rem",
+        borderRadius: "12px",
+        border: `1px solid ${palette.bar}`,
+        background: palette.pillBg,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: "0.5rem",
+        }}
+      >
+        <span style={{ fontWeight: 600, color: palette.pillText }}>{label}</span>
+        <span
+          style={{
+            fontSize: "0.75rem",
+            fontWeight: 600,
+            padding: "0.2rem 0.45rem",
+            borderRadius: "999px",
+            background: palette.pillBg,
+            color: palette.pillText,
+            textTransform: "uppercase",
+          }}
+        >
+          {status.replace("-", " ")}
+        </span>
+      </div>
+      <div
+        style={{
+          height: "12px",
+          borderRadius: "999px",
+          background: "#e2f5e9",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            width: `${safePercent}%`,
+            height: "100%",
+            background: palette.bar,
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+      <div
+        style={{
+          marginTop: "0.6rem",
+          fontSize: "0.85rem",
+          color: palette.pillText,
+        }}
+      >
+        {completed.toFixed(1)}h of {planned.toFixed(1)}h complete
+      </div>
+      <div
+        style={{
+          color: palette.bar,
+          fontSize: "0.8rem",
+          marginTop: "0.25rem",
+          fontWeight: 600,
+        }}
+      >
+        {safePercent}% complete
+      </div>
+    </div>
+  );
+}
+
 function MetricTile({
   label,
   value,
@@ -877,6 +1176,73 @@ function ActionButton({
   );
 }
 
+function AuditTrail({ entries }: { entries: ProgressAudit[] }) {
+  return (
+    <div
+      style={{
+        border: "1px solid #bae6fd",
+        borderRadius: "12px",
+        background: "#f0f9ff",
+        padding: "1rem",
+      }}
+    >
+      <div style={{ display: "grid", gap: "0.75rem" }}>
+        {entries.map((entry, index) => {
+          const isLast = index === entries.length - 1;
+          return (
+            <div
+              key={entry.id ?? `${entry.action}-${entry.createdAt}`}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "auto 1fr",
+                gap: "0.65rem",
+                alignItems: "start",
+                paddingBottom: "0.65rem",
+                borderBottom: isLast ? "none" : "1px solid #e2e8f0",
+              }}
+            >
+            <div
+              style={{
+                fontSize: "0.78rem",
+                fontWeight: 600,
+                color: "#0369a1",
+                minWidth: "160px",
+              }}
+            >
+              {formatDateTime(entry.createdAt)}
+            </div>
+            <div>
+              <div style={{ fontWeight: 600, color: "#0f172a" }}>
+                {entry.action === "status-change" ? "Status change" : "Reschedule"}
+              </div>
+              {entry.sessionTitle && (
+                <div style={{ fontSize: "0.85rem", color: "#0f172a" }}>
+                  {entry.sessionTitle}
+                  {entry.assessmentTitle ? ` • ${entry.assessmentTitle}` : ""}
+                </div>
+              )}
+              <div style={{ fontSize: "0.8rem", color: "#0369a1", marginTop: "0.2rem" }}>
+                {entry.note || "No additional notes"}
+              </div>
+              {entry.action === "status-change" && (
+                <div style={{ fontSize: "0.75rem", color: "#64748b", marginTop: "0.2rem" }}>
+                  {`Status: ${entry.beforeStatus ?? "-"} → ${entry.afterStatus ?? "-"}`}
+                </div>
+              )}
+            </div>
+            </div>
+          );
+        })}
+      </div>
+      {entries.length > 0 && (
+        <div style={{ fontSize: "0.75rem", color: "#0369a1", marginTop: "0.5rem" }}>
+          Showing {entries.length} most recent entr{entries.length === 1 ? "y" : "ies"}.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function formatISODate(date: Date) {
   return date.toISOString().slice(0, 10);
 }
@@ -885,8 +1251,29 @@ function formatDate(iso: string) {
   return formatISODate(new Date(iso));
 }
 
+function formatDateTime(iso: string) {
+  return new Date(iso).toLocaleString("en-AU", {
+    weekday: "short",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Australia/Sydney",
+  });
+}
+
 function addDays(date: Date, days: number) {
   const copy = new Date(date);
   copy.setDate(copy.getDate() + days);
   return copy;
+}
+
+function csvSafe(value: string | number | null | undefined) {
+  if (value === null || value === undefined) return "-";
+  const str = String(value);
+  if (/[",\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
 }

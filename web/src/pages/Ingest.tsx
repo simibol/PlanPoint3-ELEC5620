@@ -10,7 +10,8 @@ import {
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { parseAssessmentsCsv, CSV_TEMPLATE } from "../lib/ingest/csv";
-import { parseIcsBusy, BusyBlock } from "../lib/ingest/ics";
+import type { BusyBlock } from "../types";
+import { parseIcsBusy } from "../lib/ingest/ics";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist/build/pdf";
 import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker";
 

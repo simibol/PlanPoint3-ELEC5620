@@ -1,12 +1,6 @@
 // web/src/lib/ingest/ics.ts
 import ICAL from "ical.js";
-
-export type BusyBlock = {
-  id: string;
-  title: string;
-  start: string; // ISO
-  end: string; // ISO
-};
+import type { BusyBlock } from "../../types";
 
 export function parseIcsBusy(icsText: string): BusyBlock[] {
   const jcal = ICAL.parse(icsText);

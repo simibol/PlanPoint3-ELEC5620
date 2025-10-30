@@ -9,9 +9,16 @@ import {
   NotificationItem,
   NotificationState,
   WeeklyProgress,
+  BusyBlock,
 } from "../types";
 
 const MS_PER_DAY = 86_400_000;
+const EPSILON = 1e-4;
+
+type Slot = {
+  start: number;
+  end: number;
+};
 
 export const DEFAULT_PREFERENCES: PlannerPreferences = {
   dailyCapHours: 4,
@@ -38,9 +45,12 @@ type SubtaskInput = {
 
 type MutableDay = DaySummary & {
   workedHours: number;
-  offsetHours: number;
   assessmentLoad: Record<string, number>;
+  availableSlots: Slot[];
 };
+
+const isSessionCompleted = (status: string | undefined) =>
+  status === "completed" || status === "complete";
 
 export function withDefaults(
   prefs?: Partial<PlannerPreferences>
@@ -100,6 +110,141 @@ const toTimeString = (decimalHour: number) => {
 
 const clamp = (val: number, min: number, max: number) =>
   Math.max(min, Math.min(max, val));
+
+const sumSlotHours = (slots: Slot[]) =>
+  slots.reduce((total, slot) => total + Math.max(0, slot.end - slot.start), 0);
+
+const splitBusyBlocks = (
+  busyBlocks: BusyBlock[],
+  rangeStart: Date,
+  rangeEnd: Date
+): Map<string, Slot[]> => {
+  const map = new Map<string, Slot[]>();
+  if (!busyBlocks.length) return map;
+
+  const minDay = startOfDay(rangeStart);
+  const maxDay = startOfDay(rangeEnd);
+  const rangeEndMs = addDays(maxDay, 1).getTime();
+
+  busyBlocks.forEach((block) => {
+    const rawStart = new Date(block.start);
+    const rawEnd = new Date(block.end);
+    const startMs = rawStart.getTime();
+    const endMs = rawEnd.getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+    if (endMs <= startMs) return;
+    if (endMs <= minDay.getTime() || startMs >= rangeEndMs) return;
+
+    let cursor = startOfDay(rawStart);
+    if (cursor.getTime() < minDay.getTime()) {
+      cursor = new Date(minDay);
+    }
+
+    while (cursor.getTime() <= maxDay.getTime()) {
+      const dayStartMs = cursor.getTime();
+      const dayEndMs = dayStartMs + MS_PER_DAY;
+      if (dayStartMs >= endMs) break;
+
+      const overlapStart = Math.max(startMs, dayStartMs);
+      const overlapEnd = Math.min(endMs, dayEndMs);
+      if (overlapEnd > overlapStart + EPSILON) {
+        const dayKey = formatDateKey(cursor);
+        const startHour = (overlapStart - dayStartMs) / 3_600_000;
+        const endHour = (overlapEnd - dayStartMs) / 3_600_000;
+        if (!map.has(dayKey)) map.set(dayKey, []);
+        map.get(dayKey)!.push({
+          start: Number(startHour.toFixed(4)),
+          end: Number(endHour.toFixed(4)),
+        });
+      }
+
+      if (dayEndMs >= endMs) break;
+      cursor = addDays(cursor, 1);
+    }
+  });
+
+  // Ensure busy blocks per day are sorted
+  map.forEach((list, key) => {
+    map.set(
+      key,
+      list
+        .slice()
+        .sort((a, b) => a.start - b.start)
+        .map((slot) => ({
+          start: Number(slot.start.toFixed(4)),
+          end: Number(slot.end.toFixed(4)),
+        }))
+    );
+  });
+
+  return map;
+};
+
+const createDailySlots = (
+  prefs: PlannerPreferences,
+  busy: Slot[] | undefined,
+  isWeekend: boolean
+): Slot[] => {
+  if (!prefs.allowWeekends && isWeekend) return [];
+
+  const windowStart = prefs.startHour;
+  const windowEnd = prefs.endHour;
+  if (windowEnd <= windowStart) return [];
+
+  let slots: Slot[] = [{ start: windowStart, end: windowEnd }];
+
+  if (busy?.length) {
+    for (const block of busy) {
+      const busyStart = clamp(block.start, windowStart, windowEnd);
+      const busyEnd = clamp(block.end, windowStart, windowEnd);
+      if (busyEnd <= busyStart + EPSILON) continue;
+
+      const next: Slot[] = [];
+      for (const slot of slots) {
+        if (busyEnd <= slot.start + EPSILON || busyStart >= slot.end - EPSILON) {
+          next.push(slot);
+          continue;
+        }
+
+        if (busyStart > slot.start + EPSILON) {
+          next.push({
+            start: slot.start,
+            end: busyStart,
+          });
+        }
+
+        if (busyEnd < slot.end - EPSILON) {
+          next.push({
+            start: busyEnd,
+            end: slot.end,
+          });
+        }
+      }
+      slots = next;
+      if (!slots.length) break;
+    }
+  }
+
+  return slots
+    .map((slot) => ({
+      start: Number(slot.start.toFixed(4)),
+      end: Number(slot.end.toFixed(4)),
+    }))
+    .filter((slot) => slot.end - slot.start > 1 / 60);
+};
+
+const findPlacementInSlots = (
+  slots: Slot[],
+  duration: number
+): { index: number; start: number } | null => {
+  for (let i = 0; i < slots.length; i += 1) {
+    const slot = slots[i];
+    if (slot.end - slot.start + EPSILON >= duration) {
+      return { index: i, start: slot.start };
+    }
+  }
+  return null;
+};
 
 const divideHours = (
   totalHours: number,
@@ -171,6 +316,7 @@ type ScheduleOptions = {
   startDate?: Date;
   version?: number;
   preserveIds?: boolean;
+  busyBlocks?: BusyBlock[];
 };
 
 const scheduleSubtasks = (
@@ -181,6 +327,7 @@ const scheduleSubtasks = (
   const prefs = withDefaults(preferences);
   const start = startOfDay(options?.startDate || new Date());
   const version = options?.version ?? Date.now();
+  const busyBlocks = options?.busyBlocks ?? [];
 
   if (!subtasks.length) {
     return {
@@ -209,6 +356,7 @@ const scheduleSubtasks = (
   }
 
   const end = addDays(new Date(maxDue), 7);
+  const busyIndex = splitBusyBlocks(busyBlocks, start, end);
   const days: MutableDay[] = [];
 
   for (
@@ -216,22 +364,24 @@ const scheduleSubtasks = (
     cursor <= end;
     cursor = addDays(cursor, 1)
   ) {
+    const dateKey = formatDateKey(cursor);
     const weekend = isWeekend(cursor);
-    const baseCapacity = prefs.dailyCapHours;
-    const dailyWindow = prefs.endHour - prefs.startHour;
+    const busyForDay = busyIndex.get(dateKey);
+    const availableSlots = createDailySlots(prefs, busyForDay, weekend);
+    const slotHours = sumSlotHours(availableSlots);
     const capacity = Math.min(
-      baseCapacity,
-      dailyWindow > 0 ? dailyWindow : baseCapacity
+      prefs.dailyCapHours,
+      slotHours > 0 ? slotHours : 0
     );
     days.push({
-      date: formatDateKey(cursor),
+      date: dateKey,
       isWeekend: weekend,
-      capacity: !prefs.allowWeekends && weekend ? 0 : capacity,
+      capacity: Number(capacity.toFixed(2)),
       totalHours: 0,
       sessions: [],
       workedHours: 0,
-      offsetHours: 0,
       assessmentLoad: {},
+      availableSlots,
     });
   }
 
@@ -253,9 +403,11 @@ const scheduleSubtasks = (
       if (dayDate.getTime() < start.getTime()) continue;
 
       if (day.workedHours + sub.durationHours > day.capacity + 0.01) continue;
-      const projectedOffset =
-        day.offsetHours + sub.durationHours + (day.workedHours > 0 ? prefs.focusBlockMinutes / 60 : 0);
-      if (prefs.startHour + projectedOffset > prefs.endHour + 0.01) continue;
+      const placement = findPlacementInSlots(
+        day.availableSlots,
+        sub.durationHours
+      );
+      if (!placement) continue;
 
       const diffDays = (dueTs - dayDate.getTime()) / MS_PER_DAY;
       const load = day.assessmentLoad[sub.assessmentTitle] ?? 0;
@@ -295,6 +447,7 @@ const scheduleSubtasks = (
           "Increase daily capacity, allow weekends, or reduce session duration.",
       });
       const placeholderId = options?.preserveIds ? sub.id : makeId(sub.id);
+      const blockedBy = sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
       const placeholder: PlannedSession = {
         id: placeholderId,
         assessmentTitle: sub.assessmentTitle,
@@ -305,22 +458,61 @@ const scheduleSubtasks = (
         startTime: "09:00",
         endTime: "10:00",
         durationHours: sub.durationHours,
-        status: "pending",
+        status: "planned",
         notes: sub.notes,
         riskLevel: "at-risk",
         version,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        blockedBy: sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined,
+        ...(blockedBy ? { blockedBy } : {}),
       };
       unplaced.push(placeholder);
       return;
     }
 
-    const startTimeDecimal =
-      prefs.startHour + targetDay.offsetHours + (targetDay.workedHours > 0 ? prefs.focusBlockMinutes / 60 : 0);
+    const placement = findPlacementInSlots(
+      targetDay.availableSlots,
+      sub.durationHours
+    );
+
+    if (!placement) {
+      warnings.push({
+        type: "conflict",
+        message: `Busy times prevented scheduling "${sub.subtaskTitle}" on ${targetDay.date}.`,
+        detail:
+          "Adjust busy calendar entries or expand availability to free up space.",
+      });
+      const placeholderId = options?.preserveIds ? sub.id : makeId(sub.id);
+      const blockedBy =
+        sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
+      unplaced.push({
+        id: placeholderId,
+        assessmentTitle: sub.assessmentTitle,
+        assessmentDueDate: sub.assessmentDueDate,
+        milestoneTitle: sub.milestoneTitle,
+        subtaskTitle: sub.subtaskTitle,
+        date: formatDateKey(new Date(sub.dueDate)),
+        startTime: "09:00",
+        endTime: "10:00",
+        durationHours: sub.durationHours,
+        status: "planned",
+        notes: sub.notes,
+        riskLevel: "at-risk",
+        version,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        ...(blockedBy ? { blockedBy } : {}),
+      });
+      return;
+    }
+
+    const slot = targetDay.availableSlots[placement.index];
+    const slotEnd = slot.end;
+    const startTimeDecimal = placement.start;
     const endTimeDecimal = startTimeDecimal + sub.durationHours;
     const sessionId = options?.preserveIds ? sub.id : makeId(sub.id);
+    const blockedBy =
+      sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
     const session: PlannedSession = {
       id: sessionId,
       assessmentTitle: sub.assessmentTitle,
@@ -331,35 +523,36 @@ const scheduleSubtasks = (
       startTime: toTimeString(startTimeDecimal),
       endTime: toTimeString(endTimeDecimal),
       durationHours: sub.durationHours,
-      status: "pending",
+      status: "planned",
       notes: sub.notes,
       riskLevel,
       version,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      blockedBy:
-        sub.order > 0
-          ? lastSessionByMilestone.get(sub.milestoneTitle)
-          : undefined,
+      ...(blockedBy ? { blockedBy } : {}),
     };
 
     targetDay.sessions.push(session);
     targetDay.workedHours = Number(
       (targetDay.workedHours + sub.durationHours).toFixed(2)
     );
-    targetDay.offsetHours = Number(
-      (
-        targetDay.offsetHours +
-        sub.durationHours +
-        (targetDay.workedHours > 0 &&
-        targetDay.workedHours < targetDay.capacity
-          ? prefs.focusBlockMinutes / 60
-          : 0)
-      ).toFixed(2)
-    );
     targetDay.totalHours = targetDay.workedHours;
     targetDay.assessmentLoad[sub.assessmentTitle] =
       (targetDay.assessmentLoad[sub.assessmentTitle] || 0) + 1;
+
+    const shouldAddBreak =
+      targetDay.workedHours < targetDay.capacity - 0.01 &&
+      prefs.focusBlockMinutes > 0;
+    const breakHours = shouldAddBreak ? prefs.focusBlockMinutes / 60 : 0;
+    const nextStart = endTimeDecimal + breakHours;
+    if (nextStart >= slotEnd - EPSILON) {
+      targetDay.availableSlots.splice(placement.index, 1);
+    } else {
+      targetDay.availableSlots[placement.index] = {
+        start: Number(nextStart.toFixed(4)),
+        end: slotEnd,
+      };
+    }
 
     if (riskLevel !== "on-track") {
       warnings.push({
@@ -399,7 +592,7 @@ export const planMilestones = (
   milestones: Milestone[],
   assessments: Assessment[],
   preferences?: Partial<PlannerPreferences>,
-  options?: { startDate?: Date }
+  options?: { startDate?: Date; busyBlocks?: BusyBlock[] }
 ): PlanResult => {
   const prefs = withDefaults(preferences);
   const assessmentByTitle = new Map(
@@ -420,11 +613,11 @@ export const planMilestones = (
 export const rescheduleSessions = (
   sessions: PlannedSession[],
   preferences?: Partial<PlannerPreferences>,
-  options?: { startDate?: Date }
+  options?: { startDate?: Date; busyBlocks?: BusyBlock[] }
 ): PlanResult => {
   const prefs = withDefaults(preferences);
   const subtasks: SubtaskInput[] = sessions
-    .filter((s) => s.status !== "complete")
+    .filter((s) => !isSessionCompleted(s.status))
     .map((session, index) => ({
       id: session.id,
       assessmentTitle: session.assessmentTitle,
@@ -454,7 +647,7 @@ export const generateNotifications = (
   const nowMs = now.getTime();
 
   sessions.forEach((session) => {
-    if (session.status === "complete") return;
+    if (isSessionCompleted(session.status)) return;
     const sessionDate = parseDateKey(session.date);
     const sessionStart = new Date(sessionDate);
     const [hours, minutes] = session.startTime.split(":").map(Number);
@@ -551,7 +744,7 @@ export const buildWeeklySummaries = (
     }
     const entry = map.get(key)!;
     entry.planned += session.durationHours;
-    if (session.status === "complete") {
+    if (isSessionCompleted(session.status)) {
       entry.complete += session.durationHours;
     }
   });

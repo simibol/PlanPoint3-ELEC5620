@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   collection,
   doc,
@@ -8,6 +9,7 @@ import {
   setDoc,
   writeBatch,
   updateDoc,
+  deleteDoc,
 } from "firebase/firestore";
 
 import { onAuthStateChanged } from "firebase/auth";
@@ -18,6 +20,7 @@ import type {
   PlannerPreferences,
   PlanResult,
   PlanSession,
+  BusyBlock,
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
@@ -151,12 +154,14 @@ function riskColors(risk: PlannedSession["riskLevel"]) {
 }
 
 export default function Planner() {
+  const navigate = useNavigate();
   const [uid, setUid] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
   const [assessments, setAssessments] = useState<Assessment[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [busyBlocks, setBusyBlocks] = useState<BusyBlock[]>([]);
   const [preferences, setPreferences] =
     useState<PlannerPreferences>(DEFAULT_PREFERENCES);
   const [prefDirty, setPrefDirty] = useState(false);
@@ -184,13 +189,21 @@ export default function Planner() {
     const milestonesCol = collection(db, "users", uid, "milestones");
     const planCol = collection(db, "users", uid, "planSessions");
     const settingsDoc = doc(db, "users", uid, "settings", "planner");
+    const busyCol = collection(db, "users", uid, "busy");
 
     // live listeners for assessments & milestones
     const unsubAssess = onSnapshot(assessmentsCol, (snap) => {
       setAssessments(snap.docs.map((d) => d.data() as Assessment));
     });
     const unsubMiles = onSnapshot(milestonesCol, (snap) => {
-      setMilestones(snap.docs.map((d) => d.data() as Milestone));
+      const list = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Milestone),
+      }));
+      setMilestones(list);
+    });
+    const unsubBusy = onSnapshot(busyCol, (snap) => {
+      setBusyBlocks(snap.docs.map((d) => d.data() as BusyBlock));
     });
 
     // one-shot reads for plan + prefs
@@ -221,6 +234,7 @@ export default function Planner() {
     return () => {
       unsubAssess();
       unsubMiles();
+      unsubBusy();
     };
   }, [uid]);
 
@@ -262,6 +276,28 @@ export default function Planner() {
     }
   };
 
+  const handleDeleteMilestone = useCallback(
+    async (milestone: Milestone) => {
+      if (!uid || !milestone.id) return;
+      const confirm = window.confirm(
+        `Delete milestone "${milestone.title}" from ${milestone.assessmentTitle}?`
+      );
+      if (!confirm) return;
+      setBusy(true);
+      setError(null);
+      try {
+        await deleteDoc(doc(db, "users", uid, "milestones", milestone.id));
+        setSuccessMessage(`Removed milestone "${milestone.title}".`);
+      } catch (err: any) {
+        console.error("[Planner] delete milestone failed:", err);
+        setError(err.message || "Failed to delete milestone.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [uid]
+  );
+
   const handleGenerate = async () => {
     if (!milestones.length) {
       alert("Add milestones first via UC2.");
@@ -272,6 +308,7 @@ export default function Planner() {
     try {
       const raw = planMilestones(milestones, assessments, preferences, {
         startDate: new Date(),
+        busyBlocks,
       });
       const version = raw.version ?? 1;
 
@@ -517,63 +554,31 @@ export default function Planner() {
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr",
+              gridTemplateColumns: "1fr",
               gap: "0.75rem",
               marginTop: "0.75rem",
             }}
           >
             <NumericField
-              label="Daily focus cap (h)"
+              label="Daily max focus (h)"
               value={preferences.dailyCapHours}
               onChange={(val) => updatePref("dailyCapHours", val)}
               min={1}
               max={12}
             />
             <NumericField
-              label="Min session (min)"
-              value={preferences.minSessionMinutes}
-              onChange={(val) => updatePref("minSessionMinutes", val)}
-              min={15}
-              max={180}
-              step={5}
-            />
-            <NumericField
-              label="Max session (min)"
-              value={preferences.maxSessionMinutes}
-              onChange={(val) => updatePref("maxSessionMinutes", val)}
-              min={30}
-              max={240}
-              step={5}
-            />
-            <NumericField
-              label="Breaks (min)"
-              value={preferences.focusBlockMinutes}
-              onChange={(val) => updatePref("focusBlockMinutes", val)}
-              min={5}
-              max={45}
-              step={5}
-            />
-            <NumericField
-              label="Start hour"
+              label="Day start (hour)"
               value={preferences.startHour}
               onChange={(val) => updatePref("startHour", val)}
               min={5}
               max={12}
             />
             <NumericField
-              label="End hour"
+              label="Day end (hour)"
               value={preferences.endHour}
               onChange={(val) => updatePref("endHour", val)}
               min={13}
               max={23}
-            />
-          </div>
-
-          <div style={{ marginTop: "0.5rem" }}>
-            <ToggleField
-              label="Allow weekend sessions"
-              checked={preferences.allowWeekends}
-              onChange={(val) => updatePref("allowWeekends", val)}
             />
           </div>
 
@@ -636,6 +641,32 @@ export default function Planner() {
             {busy ? "Applying…" : "Apply to Calendar"}
           </button>
 
+          <button
+            onClick={() => navigate("/progress?catchup=1")}
+            style={{
+              marginTop: "0.65rem",
+              width: "100%",
+              padding: "0.65rem 1rem",
+              background: "#f1f5f9",
+              color: "#0369a1",
+              border: "1px solid #bae6fd",
+              borderRadius: 10,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Catch-up Reschedule
+          </button>
+          <p
+            style={{
+              marginTop: "0.4rem",
+              color: "#64748b",
+              fontSize: "0.8rem",
+            }}
+          >
+            Opens the Progress tracker preview to reallocate overdue sessions with minimal changes.
+          </p>
+
           {error && (
             <div
               style={{
@@ -686,6 +717,15 @@ export default function Planner() {
                       (acc, m) => acc + (m.estimateHrs ?? 0),
                       0
                     );
+                    const sorted = [...entries].sort((a, b) => {
+                      const aTime = a.targetDate
+                        ? new Date(a.targetDate).getTime()
+                        : Number.POSITIVE_INFINITY;
+                      const bTime = b.targetDate
+                        ? new Date(b.targetDate).getTime()
+                        : Number.POSITIVE_INFINITY;
+                      return aTime - bTime;
+                    });
                     return (
                       <div key={title} style={{ marginBottom: "0.6rem" }}>
                         <div style={{ fontWeight: 600, color: "#1e293b" }}>
@@ -693,6 +733,69 @@ export default function Planner() {
                         </div>
                         <div style={{ color: "#64748b", fontSize: "0.85rem" }}>
                           {entries.length} milestones • {total.toFixed(1)}h
+                        </div>
+                        <div style={{ marginTop: "0.35rem", display: "grid", gap: "0.35rem" }}>
+                          {sorted.map((m) => {
+                            const targetLabel = m.targetDate
+                              ? shortDate(m.targetDate)
+                              : "No target set";
+                            const estimateLabel =
+                              m.estimateHrs != null
+                                ? `${m.estimateHrs.toFixed(1)}h`
+                                : "n/a";
+                            return (
+                              <div
+                                key={m.id || `${m.title}-${m.targetDate}`}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: "0.5rem",
+                                  padding: "0.45rem 0.55rem",
+                                  border: "1px solid #e2e8f0",
+                                  borderRadius: 8,
+                                  background: "#f8fafc",
+                                }}
+                              >
+                                <div>
+                                  <div
+                                    style={{
+                                      fontSize: "0.9rem",
+                                      fontWeight: 600,
+                                      color: "#0f172a",
+                                    }}
+                                  >
+                                    {m.title}
+                                  </div>
+                                  <div
+                                    style={{
+                                      fontSize: "0.8rem",
+                                      color: "#475569",
+                                    }}
+                                  >
+                                    Target {targetLabel} • Est. {estimateLabel}
+                                  </div>
+                                </div>
+                                <button
+                                  onClick={() => handleDeleteMilestone(m)}
+                                  disabled={busy || !m.id}
+                                  style={{
+                                    padding: "0.35rem 0.55rem",
+                                    fontSize: "0.75rem",
+                                    borderRadius: 6,
+                                    border: "1px solid #f87171",
+                                    background: busy || !m.id ? "#fee2e2" : "#fef2f2",
+                                    color: "#b91c1c",
+                                    cursor:
+                                      busy || !m.id ? "not-allowed" : "pointer",
+                                    fontWeight: 600,
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     );
@@ -1045,34 +1148,6 @@ function NumericField({
           fontSize: "0.95rem",
         }}
       />
-    </label>
-  );
-}
-
-function ToggleField({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: (val: boolean) => void;
-}) {
-  return (
-    <label
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: "0.6rem",
-        fontSize: "0.92rem",
-      }}
-    >
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      {label}
     </label>
   );
 }
