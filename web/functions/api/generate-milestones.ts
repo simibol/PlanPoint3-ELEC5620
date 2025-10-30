@@ -35,17 +35,38 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
       return json({ milestones: simple, source: "rule-based" });
     }
 
+    const rubricSummary = summariseRubric(rubricText ?? "", 2200);
+
     // ---- Prompt (explicit, but compact)
-    const system = "You are a planner assistant. Output ONLY JSON. No prose.";
-    const user = `Assessment:
- - Title: ${assessment.title}
- - Due: ${assessment.dueDate}
- - Weight: ${assessment.weight ?? "unknown"}
-${rubricText ? ` - Rubric hints: ${rubricText}\n` : ""}Return 4–6 milestone steps (short titles) ordered from now until the due date.
-Valid outputs:
-  [ { "title": "string", "offsetDays": <int>, "estimateHrs": <int> } ]
-  or
-  { "milestones": [ { "title": "string", "offsetDays": <int>, "estimateHrs": <int> } ] }
+    const system =
+      "You are an academic planning assistant. Respond with JSON only – no prose, preambles, or code fences.";
+    const user = `Assessment context:
+- Title: ${assessment.title}
+- Due date (ISO): ${assessment.dueDate}
+- Days remaining (today inclusive): ${days}
+- Weight/importance: ${assessment.weight ?? "unknown"}
+${
+  rubricSummary
+    ? `- Rubric highlights (summarised):
+${rubricSummary
+  .split("\n")
+  .map((line) => `  • ${line}`)
+  .join("\n")}`
+    : "- Rubric highlights: (not supplied)"
+}
+
+Produce between 6 and 10 milestone steps that explicitly cover these rubric expectations and spread the workload from now until the due date.
+
+Strict requirements for the JSON:
+1. Each milestone object must include "title", "offsetDays", and "estimateHrs".
+2. offsetDays are integers counting days from today (0 = today). They must be strictly increasing and the final milestone must have offsetDays = ${days}.
+3. Titles must be descriptive (≤ 70 characters) and map to the rubric sections or subsections (e.g. Part A.i Research, Part B Reflection). If the rubric lists major parts or criteria, provide at least one milestone for each part; include separate milestones for notable sub-parts where appropriate.
+4. estimateHrs must be between 1 and 12 and represent realistic effort; total hours should roughly scale with the assessment weight.
+5. Ensure the milestones collectively cover research/planning, drafting/building, synthesis, editing, and submission tasks aligned with the rubric. The target dates should progress steadily toward the deadline (e.g. research early, drafting mid-way, refinement shortly before submission, submission on the due date).
+
+Valid response shapes:
+- [ { "title": "...", "offsetDays": <int>, "estimateHrs": <int> }, ... ]
+- { "milestones": [ { "title": "...", "offsetDays": <int>, "estimateHrs": <int> }, ... ] }
 `.trim();
 
     // ---- Call OpenAI with tiny retry/backoff on 429/5xx
@@ -172,6 +193,26 @@ async function safeText(r: Response) { try { return await r.text(); } catch { re
 function stripCodeFence(s: string) {
   // trim leading/trailing ```json ... ``` if present
   return s.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+}
+
+function summariseRubric(text: string, limit = 2200) {
+  if (!text) return "";
+  const cleaned = text.replace(/\r/g, "").split("\n");
+  const lines: string[] = [];
+  for (const raw of cleaned) {
+    const line = raw.trim();
+    if (!line) continue;
+    // prioritise numbered headings or bullet-like lines
+    if (/^([0-9A-Z]{1,3}[\).\s-]+|[-•*]\s+)/.test(line) || line.length > 50) {
+      lines.push(line);
+    }
+    if (lines.join("\n").length >= limit) break;
+  }
+  if (!lines.length) {
+    return cleaned.slice(0, 40).join("\n").slice(0, limit);
+  }
+  const summary = lines.join("\n");
+  return summary.length > limit ? summary.slice(0, limit) : summary;
 }
 
 function extractFirstJson(s: string) {

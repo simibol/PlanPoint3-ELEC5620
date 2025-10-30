@@ -71,10 +71,17 @@ export default function Milestones() {
     setSelected(a);
     setBusy(true);
     try {
+      const rubricBundle = [a.rubricText, a.specText]
+        .filter((segment): segment is string => Boolean(segment && segment.trim()))
+        .join("\n\n");
+
       const res = await fetch("/api/generate-milestones", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ assessment: a, rubricText: "" }),
+        body: JSON.stringify({
+          assessment: a,
+          rubricText: rubricBundle,
+        }),
       });
       if (!res.ok) {
         throw new Error(`API ${res.status}: ${await res.text()}`);

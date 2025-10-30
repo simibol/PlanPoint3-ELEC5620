@@ -11,6 +11,8 @@ import {
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { parseAssessmentsCsv, CSV_TEMPLATE } from "../lib/ingest/csv";
 import { parseIcsBusy, BusyBlock } from "../lib/ingest/ics";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist/build/pdf";
+import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker";
 
 import type { Assessment } from "../types";
 
@@ -25,6 +27,12 @@ type UploadRecord = {
   source: "file" | "manual";
 };
 
+let pdfWorkerSingleton: Worker | null = null;
+if (typeof window !== "undefined") {
+  pdfWorkerSingleton = new PdfWorker();
+  GlobalWorkerOptions.workerPort = pdfWorkerSingleton;
+}
+
 const emptyAssessment = (): EditableAssessment => ({
   title: "",
   dueDate: new Date().toISOString(),
@@ -33,6 +41,12 @@ const emptyAssessment = (): EditableAssessment => ({
   notes: "", // still fine to keep for backward compatibility
   specUrl: undefined,
   specPath: undefined,
+  specName: undefined,
+  specText: undefined,
+  rubricUrl: undefined,
+  rubricPath: undefined,
+  rubricName: undefined,
+  rubricText: undefined,
 });
 
 export default function Ingest() {
@@ -150,6 +164,7 @@ export default function Ingest() {
         }))
       );
       setRemovedIds([]);
+      setReadOnly(true);
     }
   }, [savedAssessments, rowsDirty]);
 
@@ -217,7 +232,7 @@ export default function Ingest() {
     setRowsDirty(true);
   }
 
-function updateRow(i: number, field: keyof Assessment, val: any) {
+  function updateRow(i: number, field: keyof Assessment, val: any) {
     if (readOnly) return;
     setRowsDirty(true);
     setRows((prev) => {
@@ -490,8 +505,10 @@ function updateRow(i: number, field: keyof Assessment, val: any) {
                 <p style={{ marginTop: 12, color: "#475569" }}>
                   Upload a CSV with columns:{" "}
                   <code>title, dueDate, weight, course</code>. You can edit
-                  everything below before saving. Attach a PDF spec per row in
-                  the “Specs” column.
+                  everything below before saving. Attach assignment briefs in
+                  the <strong>Specs</strong> column and detailed marking
+                  criteria in the new <strong>Rubric</strong> column so milestone
+                  generation can reference both.
                 </p>
               </div>
 
@@ -548,7 +565,8 @@ function updateRow(i: number, field: keyof Assessment, val: any) {
                       <th className="th">📅 Due (local)</th>
                       <th className="th">⚖️ Weight %</th>
                       <th className="th">🎓 Course</th>
-                      <th className="th">📎 Specs </th>
+                      <th className="th">📄 Rubric</th>
+                      <th className="th">📎 Specs</th>
                       <th className="th" style={{ width: 80 }}></th>
                     </tr>
                   </thead>
@@ -638,10 +656,97 @@ function updateRow(i: number, field: keyof Assessment, val: any) {
                                   const safeTitle = rows[i].title
                                     ? titleSlug(rows[i].title)
                                     : `assessment-${i}`;
+                                  const path = `users/${uid}/rubrics/${safeTitle}/${Date.now()}-${file.name}`;
+                                  const fileRef = ref(storage, path);
+                                  await uploadBytes(fileRef, file);
+                                  const url = await getDownloadURL(fileRef);
+                                  const text = await extractPdfText(file);
+
+                                  setRows((prev) => {
+                                    const copy = [...prev];
+                                    copy[i] = {
+                                      ...copy[i],
+                                      rubricUrl: url,
+                                      rubricPath: path,
+                                      rubricName: file.name,
+                                      rubricText: text || undefined,
+                                    } as any;
+                                    return copy;
+                                  });
+                                  setRowsDirty(true);
+                                } catch (err: any) {
+                                  alert(
+                                    err?.message || "Failed to upload rubric PDF."
+                                  );
+                                }
+                              }}
+                              disabled={readOnly}
+                            />
+                            {(r as any).rubricUrl && (
+                              <div style={{ display: "flex", gap: 8 }}>
+                                <a
+                                  href={(r as any).rubricUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{ fontSize: "0.9rem" }}
+                                >
+                                  📑 {(r as any).rubricName || "View rubric"}
+                                </a>
+                                {!readOnly && (
+                                  <button
+                                    onClick={() => {
+                                      setRows((prev) => {
+                                        const copy = [...prev];
+                                        copy[i] = {
+                                          ...copy[i],
+                                          rubricUrl: undefined,
+                                          rubricPath: undefined,
+                                          rubricName: undefined,
+                                          rubricText: undefined,
+                                        } as any;
+                                        return copy;
+                                      });
+                                      setRowsDirty(true);
+                                    }}
+                                    style={{ ...linkBtn, padding: 0 }}
+                                  >
+                                    Remove
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td className="td" style={{ minWidth: 220 }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <input
+                              type="file"
+                              accept="application/pdf"
+                              onChange={async (e) => {
+                                const file = e.target.files?.[0];
+                                e.currentTarget.value = "";
+                                if (!file) return;
+                                if (!uid) {
+                                  alert("Please sign in first.");
+                                  return;
+                                }
+
+                                try {
+                                  const safeTitle = rows[i].title
+                                    ? titleSlug(rows[i].title)
+                                    : `assessment-${i}`;
                                   const path = `users/${uid}/specs/${safeTitle}/${Date.now()}-${file.name}`;
                                   const fileRef = ref(storage, path);
                                   await uploadBytes(fileRef, file);
                                   const url = await getDownloadURL(fileRef);
+                                  const text = await extractPdfText(file);
 
                                   // stash on the row; saved to Firestore by saveAssessments()
                                   setRows((prev) => {
@@ -651,6 +756,7 @@ function updateRow(i: number, field: keyof Assessment, val: any) {
                                       specUrl: url,
                                       specPath: path,
                                       specName: file.name,
+                                      specText: text || undefined,
                                     } as any;
                                     return copy;
                                   });
@@ -683,6 +789,7 @@ function updateRow(i: number, field: keyof Assessment, val: any) {
                                           specUrl: undefined,
                                           specPath: undefined,
                                           specName: undefined,
+                                          specText: undefined,
                                         } as any;
                                         return copy;
                                       });
@@ -1047,6 +1154,30 @@ function toLocalInputValue(iso: string) {
 function fromLocalInputValue(v: string) {
   const d = new Date(v);
   return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
+
+async function extractPdfText(file: File): Promise<string> {
+  try {
+    const data = await file.arrayBuffer();
+    const loadingTask = getDocument({ data });
+    const doc = await loadingTask.promise;
+    let combined = "";
+    for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+      const page = await doc.getPage(pageNum);
+      const content = await page.getTextContent();
+      const pageText = content.items
+        .map((item: any) => (typeof item.str === "string" ? item.str : ""))
+        .join(" ");
+      combined += pageText + "\n";
+    }
+    await doc.cleanup();
+    doc.destroy();
+    const normalised = combined.replace(/\s+/g, " ").trim();
+    return normalised.slice(0, 20000);
+  } catch (err) {
+    console.error("[Ingest] Failed to extract PDF text", err);
+    return "";
+  }
 }
 
 const uploadBox: React.CSSProperties = {
