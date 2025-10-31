@@ -1,19 +1,14 @@
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db, storage } from "../firebase";
-import {
-  collection,
-  doc,
-  writeBatch,
-  onSnapshot,
-  setDoc,
-} from "firebase/firestore";
+import { collection, doc, writeBatch, onSnapshot, setDoc } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { parseAssessmentsCsv, CSV_TEMPLATE } from "../lib/ingest/csv";
 import type { BusyBlock } from "../types";
 import { parseIcsBusy } from "../lib/ingest/ics";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist/build/pdf";
 import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker";
+import { cascadeDeleteAssessments } from "../lib/dataCleanup";
 
 import type { Assessment } from "../types";
 
@@ -281,11 +276,33 @@ export default function Ingest() {
         nextRows.push({ ...a, id: docRef.id });
       });
 
-      Array.from(new Set(removedIds))
-        .filter((id) => id && !keepIds.has(id))
-        .forEach((id) => batch.delete(doc(col, id)));
+      const removalCandidates = Array.from(new Set(removedIds)).filter(
+        (id): id is string => Boolean(id && !keepIds.has(id))
+      );
+      const removalSet = new Set(removalCandidates);
+      removalCandidates.forEach((id) => batch.delete(doc(col, id)));
+      const removedAssessmentsMeta = savedAssessments.filter(
+        (a): a is EditableAssessment & { id: string } =>
+          Boolean(a.id && removalSet.has(a.id) && a.title)
+      );
 
       await batch.commit();
+      if (removedAssessmentsMeta.length) {
+        try {
+          await cascadeDeleteAssessments(
+            uid,
+            removedAssessmentsMeta.map(({ title, dueDate }) => ({
+              title,
+              dueDate,
+            }))
+          );
+        } catch (cascadeError) {
+          console.error(
+            "[Ingest] failed to remove linked data for deleted assessments",
+            cascadeError
+          );
+        }
+      }
       setRows(nextRows);
       setRowsDirty(false);
       setRemovedIds([]);
@@ -1273,6 +1290,7 @@ function tabBtnStyle(active: boolean): React.CSSProperties {
     cursor: "pointer",
   };
 }
+
 const primary = "linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)";
 const primaryBtn = (disabled?: boolean): React.CSSProperties => ({
   display: "inline-flex",

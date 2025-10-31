@@ -19,7 +19,6 @@ import type {
   Milestone,
   PlannerPreferences,
   PlanResult,
-  PlanSession,
   BusyBlock,
   DaySummary,
 } from "../types";
@@ -28,6 +27,7 @@ import {
   planMilestones,
   withDefaults,
 } from "../lib/planner";
+import { cascadeDeleteMilestone } from "../lib/dataCleanup";
 
 import type { PlannedSession, SessionStatus, RiskLevel } from "../types";
 
@@ -368,8 +368,53 @@ export default function Planner() {
       if (!confirm) return;
       setBusy(true);
       setError(null);
+      let removedSessions = 0;
       try {
         await deleteDoc(doc(db, "users", uid, "milestones", milestone.id));
+        await cascadeDeleteMilestone(uid, milestone);
+        setPlan((prev) => {
+          if (!prev) return prev;
+          const isTarget = (session: PlannedSession) =>
+            session.assessmentTitle === milestone.assessmentTitle &&
+            session.milestoneTitle === milestone.title;
+
+          const filteredSessions = prev.sessions.filter((session) => {
+            const match = isTarget(session);
+            if (match) removedSessions += 1;
+            return !match;
+          });
+
+          const filteredDays = prev.days.map((day) => {
+            const daySessions = day.sessions.filter((session) => !isTarget(session));
+            const totalHours = daySessions.reduce(
+              (total, session) => total + session.durationHours,
+              0
+            );
+            return {
+              ...day,
+              sessions: daySessions,
+              totalHours: Number(totalHours.toFixed(2)),
+            };
+          });
+
+          const filteredUnplaced = prev.unplaced.filter((session) => !isTarget(session));
+
+          if (!filteredSessions.length) {
+            return null;
+          }
+
+          return {
+            ...prev,
+            sessions: filteredSessions,
+            days: filteredDays,
+            unplaced: filteredUnplaced,
+          };
+        });
+        if (removedSessions) {
+          setActivePlanCount((prevCount) =>
+            Math.max(0, prevCount - removedSessions)
+          );
+        }
         setSuccessMessage(`Removed milestone "${milestone.title}".`);
       } catch (err: any) {
         console.error("[Planner] delete milestone failed:", err);
