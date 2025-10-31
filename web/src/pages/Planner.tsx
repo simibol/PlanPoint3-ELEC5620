@@ -618,8 +618,8 @@ export default function Planner() {
           maxWidth: "1200px",
           margin: "0 auto",
           display: "grid",
-          gridTemplateColumns: "340px 1fr",
-          gap: "1rem",
+          gridTemplateColumns: "minmax(230px, 25%) minmax(0, 1fr)",
+          gap: "0.9rem",
         }}
       >
         {/* LEFT: Preferences & actions */}
@@ -628,7 +628,7 @@ export default function Planner() {
             background: "white",
             borderRadius: 16,
             boxShadow: "0 18px 40px rgba(14,165,233,0.15)",
-            padding: "1rem",
+            padding: "0.85rem",
           }}
         >
           <h2 style={{ margin: 0, fontSize: "1.1rem", color: "#0f172a" }}>
@@ -638,7 +638,7 @@ export default function Planner() {
             style={{
               display: "grid",
               gridTemplateColumns: "1fr",
-              gap: "0.75rem",
+              gap: "0.6rem",
               marginTop: "0.75rem",
             }}
           >
@@ -895,7 +895,7 @@ export default function Planner() {
             background: "white",
             borderRadius: 16,
             boxShadow: "0 18px 40px rgba(14,165,233,0.15)",
-            padding: "1rem",
+            padding: "0.9rem",
             minHeight: 600,
             position: "relative",
             overflow: "hidden",
@@ -1105,6 +1105,7 @@ function DayColumn({
         display: "flex",
         flexDirection: "column",
         gap: "0.5rem",
+        minWidth: 0,
       }}
     >
       <header
@@ -1170,7 +1171,7 @@ function SessionCard({
         borderRadius: 12,
         border: `2px solid ${borderColor}`,
         background,
-        padding: "0.65rem",
+        padding: "0.55rem",
         boxShadow: highlighted
           ? "0 0 0 4px rgba(56,189,248,0.2), 0 6px 18px rgba(15,23,42,0.18)"
           : "0 2px 6px rgba(15,23,42,0.05)",
