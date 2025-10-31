@@ -8,11 +8,11 @@ export default function Header() {
 
   return (
     <div style={{ display:"flex", gap:12, padding:12, borderBottom:"1px solid #eee" }}>
+      <Link to="/">Home</Link>
       <Link to="/ingest">Ingest</Link>
       <Link to="/milestones">Milestones</Link>
       <Link to="/planner">Planner</Link>
       <Link to="/progress">Progress</Link>
-      <Link to="/notifications">Notifications</Link>
       <div style={{ marginLeft:"auto" }}>
         {user ? (
           <>

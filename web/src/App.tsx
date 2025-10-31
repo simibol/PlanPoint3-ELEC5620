@@ -14,11 +14,11 @@ export default function App() {
       <h1>PlanPoint</h1>
       <p>Welcome, {u.displayName || u.email}</p>
       <nav style={{ display: "flex", gap: 12 }}>
+        <Link to="/">Home</Link>
         <Link to="/ingest">Upload Schedule (UC1)</Link>
         <Link to="/milestones">Milestones (UC2)</Link>
         <Link to="/planner">Auto Planner (UC3)</Link>
         <Link to="/progress">Progress Tracker (UC4)</Link>
-        <Link to="/notifications">Notifications (UC5)</Link>
       </nav>
     </div>
   );

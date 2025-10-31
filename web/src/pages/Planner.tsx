@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   collection,
   doc,
@@ -21,6 +21,7 @@ import type {
   PlanResult,
   PlanSession,
   BusyBlock,
+  DaySummary,
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
@@ -174,6 +175,13 @@ export default function Planner() {
 
   // week paging for calendar preview
   const [weekStartIndex, setWeekStartIndex] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [highlightedSessionId, setHighlightedSessionId] = useState<string | null>(null);
+  const focusSessionId = searchParams.get("focus");
+  const emptyState = useMemo(
+    () => milestones.length === 0 && (!plan || plan.sessions.length === 0),
+    [milestones.length, plan]
+  );
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
@@ -217,13 +225,65 @@ export default function Planner() {
         const first = planSnap.docs[0]?.data() as
           | { version?: number }
           | undefined;
+        const prefs = prefsSnap.exists()
+          ? withDefaults(prefsSnap.data() as PlannerPreferences)
+          : DEFAULT_PREFERENCES;
+        setPreferences(prefs);
         setActiveVersion(first?.version ?? null);
 
-        setPreferences(
-          prefsSnap.exists()
-            ? withDefaults(prefsSnap.data() as PlannerPreferences)
-            : DEFAULT_PREFERENCES
-        );
+        const existingSessions: PlannedSession[] = planSnap.docs
+          .map((docSnap) => {
+            const data = docSnap.data() as PlannedSession;
+            return {
+              ...data,
+              id: docSnap.id,
+              status: (data.status as SessionStatus) ?? "planned",
+            };
+          })
+          .sort((a, b) => {
+            const dateDiff = a.date.localeCompare(b.date);
+            if (dateDiff !== 0) return dateDiff;
+            return a.startTime.localeCompare(b.startTime);
+          });
+
+        if (existingSessions.length) {
+          const byDate = new Map<string, PlannedSession[]>();
+          existingSessions.forEach((session) => {
+            if (!byDate.has(session.date)) {
+              byDate.set(session.date, []);
+            }
+            byDate.get(session.date)!.push(session);
+          });
+
+          const days: DaySummary[] = Array.from(byDate.entries())
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([date, sessions]) => {
+              const total = sessions.reduce(
+                (sum, s) => sum + s.durationHours,
+                0
+              );
+              const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+              return {
+                date,
+                isWeekend: dayOfWeek === 0 || dayOfWeek === 6,
+                capacity: prefs.dailyCapHours,
+                totalHours: Number(total.toFixed(2)),
+                sessions: sessions
+                  .slice()
+                  .sort((a, b) => a.startTime.localeCompare(b.startTime)),
+              };
+            });
+
+          setPlan({
+            sessions: existingSessions,
+            days,
+            warnings: [],
+            unplaced: [],
+            version: first?.version ?? Date.now(),
+          });
+        } else {
+          setPlan(null);
+        }
       } catch (e: any) {
         setError(e.message || "Failed to load planner data.");
       } finally {
@@ -253,6 +313,29 @@ export default function Planner() {
     setSuccessMessage(null);
     setWeekStartIndex(0);
   }, [plan]);
+
+  useEffect(() => {
+    if (!focusSessionId) return;
+    if (!plan || !plan.sessions.length) return;
+    const target = plan.sessions.find((s) => s.id === focusSessionId);
+    if (!target) return;
+    const targetDate = new Date(`${target.date}T00:00:00`);
+    const baseMonday = startOfWeekMonday(new Date());
+    const diffDays = Math.floor(
+      (startOfDay(targetDate).getTime() - startOfDay(baseMonday).getTime()) /
+        86_400_000
+    );
+    if (diffDays >= 0) {
+      const newIndex = Math.floor(diffDays / 7) * 7;
+      if (newIndex !== weekStartIndex) {
+        setWeekStartIndex(newIndex);
+      }
+    }
+    setHighlightedSessionId(focusSessionId);
+    const params = new URLSearchParams(searchParams);
+    params.delete("focus");
+    setSearchParams(params, { replace: true });
+  }, [focusSessionId, plan, weekStartIndex, searchParams, setSearchParams]);
 
   const updatePref = <K extends keyof PlannerPreferences>(
     key: K,
@@ -814,8 +897,26 @@ export default function Planner() {
             boxShadow: "0 18px 40px rgba(14,165,233,0.15)",
             padding: "1rem",
             minHeight: 600,
+            position: "relative",
+            overflow: "hidden",
           }}
         >
+          {emptyState && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                background: "rgba(255,255,255,0.92)",
+                zIndex: 5,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "2rem",
+              }}
+            >
+              <EmptyPlannerGuide onStart={() => navigate("/ingest")} />
+            </div>
+          )}
           <div
             style={{
               display: "flex",
@@ -874,6 +975,7 @@ export default function Planner() {
                       key={day.date}
                       day={day}
                       onToggleDone={toggleDone}
+                      highlightedSessionId={highlightedSessionId}
                     />
                   )
                 )}
@@ -946,12 +1048,51 @@ function EmptyCalendarHint() {
   );
 }
 
+function EmptyPlannerGuide({ onStart }: { onStart: () => void }) {
+  return (
+    <div
+      style={{
+        maxWidth: 480,
+        textAlign: "center",
+        background: "white",
+        borderRadius: 16,
+        padding: "2rem",
+        boxShadow: "0 12px 32px rgba(14,165,233,0.25)",
+      }}
+    >
+      <div style={{ fontSize: "2rem", marginBottom: "0.5rem" }}>🚀</div>
+      <h3 style={{ margin: 0, color: "#0f172a" }}>Let’s get you started</h3>
+      <p style={{ color: "#475569", fontSize: "0.95rem", marginTop: "0.5rem" }}>
+        No milestones or sessions detected yet. Import your timetable or CSV so we can build your study plan automatically.
+      </p>
+      <button
+        onClick={onStart}
+        style={{
+          marginTop: "1rem",
+          padding: "0.75rem 1.5rem",
+          borderRadius: 12,
+          border: "none",
+          background: "linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%)",
+          color: "white",
+          fontWeight: 700,
+          cursor: "pointer",
+          boxShadow: "0 10px 24px rgba(99,102,241,0.35)",
+        }}
+      >
+        Go to Ingest
+      </button>
+    </div>
+  );
+}
+
 function DayColumn({
   day,
   onToggleDone,
+  highlightedSessionId,
 }: {
   day: PlanResult["days"][number];
   onToggleDone: (id: string, next: boolean) => void;
+  highlightedSessionId?: string | null;
 }) {
   return (
     <div
@@ -999,7 +1140,12 @@ function DayColumn({
           .slice()
           .sort((a, b) => a.startTime.localeCompare(b.startTime))
           .map((s) => (
-            <SessionCard key={s.id} session={s} onToggleDone={onToggleDone} />
+            <SessionCard
+              key={s.id}
+              session={s}
+              onToggleDone={onToggleDone}
+              highlighted={highlightedSessionId === s.id}
+            />
           ))
       )}
     </div>
@@ -1009,19 +1155,26 @@ function DayColumn({
 function SessionCard({
   session,
   onToggleDone,
+  highlighted,
 }: {
   session: PlannedSession;
   onToggleDone: (id: string, next: boolean) => void;
+  highlighted?: boolean;
 }) {
   const color = riskColors(session.riskLevel);
+  const borderColor = highlighted ? "#38bdf8" : color.border;
+  const background = highlighted ? "#e0f2fe" : color.bg;
   return (
     <div
       style={{
         borderRadius: 12,
-        border: `1px solid ${color.border}`,
-        background: color.bg,
-        padding: "0.6rem",
-        boxShadow: "0 2px 6px rgba(15,23,42,0.05)",
+        border: `2px solid ${borderColor}`,
+        background,
+        padding: "0.65rem",
+        boxShadow: highlighted
+          ? "0 0 0 4px rgba(56,189,248,0.2), 0 6px 18px rgba(15,23,42,0.18)"
+          : "0 2px 6px rgba(15,23,42,0.05)",
+        transition: "box-shadow 0.2s ease",
       }}
     >
       <div
@@ -1039,13 +1192,20 @@ function SessionCard({
         </div>
       </div>
       <div
-        style={{ fontSize: "0.85rem", color: "#475569", marginTop: "0.2rem" }}
+        style={{ fontSize: "0.82rem", color: "#475569", marginTop: "0.25rem" }}
       >
         {session.assessmentTitle} • {session.milestoneTitle}
       </div>
       {session.notes && (
         <div
-          style={{ fontSize: "0.78rem", color: "#64748b", marginTop: "0.2rem" }}
+          style={{
+            fontSize: "0.78rem",
+            color: "#1e293b",
+            marginTop: "0.35rem",
+            background: "rgba(148,163,184,0.18)",
+            padding: "0.4rem 0.5rem",
+            borderRadius: 8,
+          }}
         >
           {session.notes}
         </div>
@@ -1054,27 +1214,45 @@ function SessionCard({
         style={{
           display: "flex",
           justifyContent: "space-between",
-          marginTop: "0.4rem",
+          alignItems: "center",
+          marginTop: "0.5rem",
         }}
       >
-        <span style={{ fontSize: "0.8rem", color: "#475569" }}>
-          {session.durationHours.toFixed(1)}h
-        </span>
-        <label
+        <span
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "0.4rem",
-            fontSize: "0.85rem",
+            fontSize: "0.75rem",
+            color: color.text,
+            background: color.bg,
+            padding: "0.2rem 0.55rem",
+            borderRadius: "999px",
+            border: `1px solid ${color.border}`,
+            textTransform: "capitalize",
           }}
         >
-          <input
-            type="checkbox"
-            checked={isDone(session.status)}
-            onChange={(e) => onToggleDone(session.id, e.target.checked)}
-          />
-          Done
-        </label>
+          {session.riskLevel.replace("-", " ")}
+        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+          <span style={{ fontSize: "0.8rem", color: "#475569" }}>
+            {session.durationHours.toFixed(1)}h
+          </span>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.35rem",
+              fontSize: "0.8rem",
+              color: "#0f172a",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={isDone(session.status)}
+              onChange={(e) => onToggleDone(session.id, e.target.checked)}
+            />
+            Done
+          </label>
+        </div>
       </div>
     </div>
   );
