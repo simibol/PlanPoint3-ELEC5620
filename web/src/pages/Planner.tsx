@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   collection,
@@ -172,16 +172,24 @@ export default function Planner() {
   const [activeVersion, setActiveVersion] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [prefError, setPrefError] = useState<string | null>(null);
 
   // week paging for calendar preview
   const [weekStartIndex, setWeekStartIndex] = useState(0);
   const [searchParams, setSearchParams] = useSearchParams();
   const [highlightedSessionId, setHighlightedSessionId] = useState<string | null>(null);
+  const [selectedSession, setSelectedSession] = useState<PlannedSession | null>(null);
   const focusSessionId = searchParams.get("focus");
   const emptyState = useMemo(
     () => milestones.length === 0 && (!plan || plan.sessions.length === 0),
     [milestones.length, plan]
   );
+
+  const timeLabels = useMemo(
+    () => generateTimeLabels(preferences.startHour, preferences.endHour),
+    [preferences.startHour, preferences.endHour]
+  );
+
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
@@ -308,10 +316,18 @@ export default function Planner() {
     return map;
   }, [milestones]);
 
+  const lastPlanSignatureRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!plan) return;
+    const signature = `${plan.version ?? "na"}|${plan.sessions.length}`;
+    if (lastPlanSignatureRef.current === signature) {
+      return;
+    }
+    lastPlanSignatureRef.current = signature;
     setSuccessMessage(null);
     setWeekStartIndex(0);
+    setSelectedSession(null);
   }, [plan]);
 
   useEffect(() => {
@@ -343,15 +359,24 @@ export default function Planner() {
   ) => {
     setPreferences((prev) => ({ ...prev, [key]: value }));
     setPrefDirty(true);
+    setPrefError(null);
   };
 
   const handleSavePreferences = async () => {
     if (!uid) return;
+    const availableHours = preferences.endHour - preferences.startHour;
+    if (availableHours < preferences.dailyCapHours) {
+      setPrefError(
+        "Daily focus hours exceed the available time window. Adjust start/end or reduce focus hours."
+      );
+      return;
+    }
     try {
       await setDoc(doc(db, "users", uid, "settings", "planner"), preferences, {
         merge: true,
       });
       setPrefDirty(false);
+      setPrefError(null);
       setSuccessMessage("Preferences saved.");
     } catch (err: any) {
       console.error("[Planner] save preferences failed:", err);
@@ -591,7 +616,7 @@ export default function Planner() {
       {/* Header + metrics */}
       <div
         style={{
-          maxWidth: "1200px",
+          maxWidth: "1400px",
           margin: "0 auto 1rem auto",
           color: "white",
           padding: "1rem 0.5rem",
@@ -660,10 +685,10 @@ export default function Planner() {
       {/* Two-pane layout */}
       <div
         style={{
-          maxWidth: "1200px",
+          maxWidth: "1400px",
           margin: "0 auto",
           display: "grid",
-          gridTemplateColumns: "minmax(230px, 25%) minmax(0, 1fr)",
+          gridTemplateColumns: "minmax(260px, 22%) minmax(0, 1fr)",
           gap: "0.9rem",
         }}
       >
@@ -694,19 +719,19 @@ export default function Planner() {
               min={1}
               max={12}
             />
-            <NumericField
-              label="Day start (hour)"
+            <TimeField
+              label="Day start"
               value={preferences.startHour}
               onChange={(val) => updatePref("startHour", val)}
-              min={5}
-              max={12}
+              min={4}
+              max={23}
             />
-            <NumericField
-              label="Day end (hour)"
+            <TimeField
+              label="Day end"
               value={preferences.endHour}
               onChange={(val) => updatePref("endHour", val)}
-              min={13}
-              max={23}
+              min={5}
+              max={24}
             />
           </div>
 
@@ -747,6 +772,21 @@ export default function Planner() {
               {busy ? "Planning…" : "Generate"}
             </button>
           </div>
+
+          {prefError && (
+            <div
+              style={{
+                marginTop: "0.5rem",
+                padding: "0.55rem 0.65rem",
+                borderRadius: 10,
+                background: "#fee2e2",
+                color: "#991b1b",
+                fontSize: "0.85rem",
+              }}
+            >
+              {prefError}
+            </div>
+          )}
 
           <button
             onClick={handleApply}
@@ -943,7 +983,7 @@ export default function Planner() {
             padding: "0.9rem",
             minHeight: 600,
             position: "relative",
-            overflow: "hidden",
+            overflow: "visible",
           }}
         >
           {emptyState && (
@@ -983,13 +1023,23 @@ export default function Planner() {
                 {rangeTitle}
               </div>
             </div>
-            <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
               <button
                 onClick={() => setWeekStartIndex((i) => Math.max(0, i - 7))}
                 disabled={!canPrev}
                 style={navBtnStyle(!canPrev)}
               >
                 ◀ Prev
+              </button>
+              <button
+                onClick={() => {
+                  setWeekStartIndex(0);
+                  setHighlightedSessionId(null);
+                  setSelectedSession(null);
+                }}
+                style={navBtnStyle(false)}
+              >
+                ⬤ Today
               </button>
               <button
                 onClick={() => setWeekStartIndex((i) => (canNext ? i + 7 : i))}
@@ -1006,25 +1056,35 @@ export default function Planner() {
             <EmptyCalendarHint />
           ) : (
             <>
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(7, 1fr)",
-                  gap: "0.75rem",
-                  marginTop: "0.75rem",
-                }}
-              >
-                {weekDays.map(
-                  (day: PlanResult["days"][number], idx: number) => (
+              <div style={{ overflowX: "auto", paddingBottom: "0.5rem" }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "auto repeat(7, minmax(220px, 1fr))",
+                    gap: "1rem",
+                    marginTop: "0.75rem",
+                    minWidth: "calc(220px * 7 + 140px)",
+                  }}
+                >
+                  <TimeColumn labels={timeLabels} />
+                  {weekDays.map((day) => (
                     <DayColumn
                       key={day.date}
                       day={day}
                       onToggleDone={toggleDone}
                       highlightedSessionId={highlightedSessionId}
+                      onSelectSession={(session) => setSelectedSession(session)}
                     />
-                  )
-                )}
+                  ))}
+                </div>
               </div>
+
+              {selectedSession && (
+                <SessionDetail
+                  session={selectedSession}
+                  onClose={() => setSelectedSession(null)}
+                />
+              )}
 
               {/* Unplaced */}
               {!!plan.unplaced.length && (
@@ -1134,19 +1194,21 @@ function DayColumn({
   day,
   onToggleDone,
   highlightedSessionId,
+  onSelectSession,
 }: {
   day: PlanResult["days"][number];
   onToggleDone: (id: string, next: boolean) => void;
   highlightedSessionId?: string | null;
+  onSelectSession: (session: PlannedSession) => void;
 }) {
   return (
     <div
       style={{
         border: "1px solid #e2e8f0",
         borderRadius: 12,
-        padding: "0.75rem",
+        padding: "1rem",
         background: "#ffffff",
-        minHeight: 420,
+        minHeight: 440,
         display: "flex",
         flexDirection: "column",
         gap: "0.5rem",
@@ -1191,6 +1253,7 @@ function DayColumn({
               session={s}
               onToggleDone={onToggleDone}
               highlighted={highlightedSessionId === s.id}
+              onSelect={onSelectSession}
             />
           ))
       )}
@@ -1202,10 +1265,12 @@ function SessionCard({
   session,
   onToggleDone,
   highlighted,
+  onSelect,
 }: {
   session: PlannedSession;
   onToggleDone: (id: string, next: boolean) => void;
   highlighted?: boolean;
+  onSelect: (session: PlannedSession) => void;
 }) {
   const color = riskColors(session.riskLevel);
   const borderColor = highlighted ? "#38bdf8" : color.border;
@@ -1221,7 +1286,9 @@ function SessionCard({
           ? "0 0 0 4px rgba(56,189,248,0.2), 0 6px 18px rgba(15,23,42,0.18)"
           : "0 2px 6px rgba(15,23,42,0.05)",
         transition: "box-shadow 0.2s ease",
+        cursor: "pointer",
       }}
+      onClick={() => onSelect(session)}
     >
       <div
         style={{
@@ -1290,11 +1357,13 @@ function SessionCard({
               color: "#0f172a",
               cursor: "pointer",
             }}
+            onClick={(e) => e.stopPropagation()}
           >
             <input
               type="checkbox"
               checked={isDone(session.status)}
               onChange={(e) => onToggleDone(session.id, e.target.checked)}
+              style={{ width: 18, height: 18 }}
             />
             Done
           </label>
@@ -1374,4 +1443,214 @@ function NumericField({
       />
     </label>
   );
+}
+
+function TimeField({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+}: {
+  label: string;
+  value: number;
+  onChange: (val: number) => void;
+  min: number;
+  max: number;
+}) {
+  const inputValue = toTimeInputValue(value);
+  return (
+    <label
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "0.25rem",
+        fontSize: "0.9rem",
+        color: "#0f172a",
+      }}
+    >
+      {label}
+      <input
+        type="time"
+        value={inputValue}
+        step={900}
+        onChange={(e) => {
+          const parsed = fromTimeInputValue(e.target.value);
+          if (Number.isFinite(parsed)) {
+            const clamped = Math.min(max, Math.max(min, parsed));
+            onChange(clamped);
+          }
+        }}
+        style={{
+          padding: "0.55rem 0.65rem",
+          borderRadius: 8,
+          border: "1px solid #cbd5e1",
+          fontSize: "0.95rem",
+        }}
+      />
+    </label>
+  );
+}
+
+function toTimeInputValue(hour: number) {
+  const base = Math.floor(hour);
+  const minutes = Math.round((hour - base) * 60);
+  return `${String((base + 24) % 24).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function fromTimeInputValue(value: string) {
+  if (!value) return NaN;
+  const [h, m] = value.split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return NaN;
+  return h + m / 60;
+}
+
+function TimeColumn({ labels }: { labels: string[] }) {
+  return (
+    <div
+      style={{
+        minHeight: 440,
+        padding: "1rem 0.5rem",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "space-between",
+        color: "#64748b",
+        fontSize: "0.85rem",
+        alignItems: "flex-end",
+      }}
+    >
+      {labels.map((label) => (
+        <div key={label} style={{ padding: "0.35rem 0.5rem" }}>
+          {label}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SessionDetail({
+  session,
+  onClose,
+}: {
+  session: PlannedSession;
+  onClose: () => void;
+}) {
+  const color = riskColors(session.riskLevel);
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: "1.5rem",
+        right: "1.5rem",
+        width: 320,
+        maxWidth: "90%",
+        background: "white",
+        borderRadius: 16,
+        boxShadow: "0 20px 50px rgba(15,23,42,0.25)",
+        padding: "1.25rem",
+        zIndex: 10,
+      }}
+    >
+      <button
+        onClick={onClose}
+        style={{
+          position: "absolute",
+          top: 12,
+          right: 12,
+          background: "transparent",
+          border: "none",
+          fontSize: "1.1rem",
+          cursor: "pointer",
+          color: "#475569",
+        }}
+        aria-label="Close session details"
+      >
+        ✕
+      </button>
+      <h3 style={{ margin: "0 0 0.4rem 0", color: "#0f172a" }}>
+        {session.subtaskTitle}
+      </h3>
+      <div style={{ color: "#475569", marginBottom: "0.6rem" }}>
+        {longDate(session.date)} • {session.startTime} – {session.endTime}
+      </div>
+      <div
+        style={{
+          background: color.bg,
+          color: color.text,
+          border: `1px solid ${color.border}`,
+          padding: "0.4rem 0.6rem",
+          borderRadius: 999,
+          fontSize: "0.78rem",
+          display: "inline-block",
+          textTransform: "capitalize",
+        }}
+      >
+        {session.riskLevel.replace("-", " ")}
+      </div>
+      <div style={{ marginTop: "0.8rem", color: "#334155", fontSize: "0.9rem" }}>
+        <strong>Assessment:</strong> {session.assessmentTitle}
+        <br />
+        <strong>Milestone:</strong> {session.milestoneTitle}
+        <br />
+        <strong>Duration:</strong> {session.durationHours.toFixed(1)} hours
+      </div>
+      {session.notes && (
+        <div
+          style={{
+            marginTop: "0.8rem",
+            padding: "0.75rem 0.9rem",
+            background: "#f8fafc",
+            borderRadius: 12,
+            color: "#1e293b",
+            fontSize: "0.9rem",
+          }}
+        >
+          {session.notes}
+        </div>
+      )}
+      <button
+        onClick={() => onClose()}
+        style={{
+          marginTop: "1rem",
+          width: "100%",
+          padding: "0.6rem",
+          borderRadius: 10,
+          border: "none",
+          background: "linear-gradient(135deg,#38bdf8,#6366f1)",
+          color: "white",
+          fontWeight: 600,
+          cursor: "pointer",
+        }}
+      >
+        Close
+      </button>
+    </div>
+  );
+}
+
+function generateTimeLabels(startHour: number, endHour: number) {
+  const labels: string[] = [];
+  const start = Math.min(startHour, endHour);
+  const finish = Math.max(startHour, endHour);
+  for (let hour = start; hour <= finish; hour += 1) {
+    labels.push(formatHourLabel(hour));
+  }
+  if (!labels.includes(formatHourLabel(finish))) {
+    labels.push(formatHourLabel(finish));
+  }
+  return labels;
+}
+
+function formatHourLabel(hour: number) {
+  const baseHour = Math.floor(hour);
+  const minutes = Math.round((hour - baseHour) * 60);
+  const date = new Date();
+  date.setHours(baseHour);
+  date.setMinutes(minutes);
+  const opts: Intl.DateTimeFormatOptions = {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  };
+  return date.toLocaleTimeString("en-AU", opts);
 }
