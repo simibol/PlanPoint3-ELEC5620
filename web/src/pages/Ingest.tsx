@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db, storage } from "../firebase";
-import { collection, doc, writeBatch, onSnapshot, setDoc } from "firebase/firestore";
+import {
+  collection,
+  doc,
+  writeBatch,
+  onSnapshot,
+  setDoc,
+  deleteDoc,
+} from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { parseAssessmentsCsv, CSV_TEMPLATE } from "../lib/ingest/csv";
 import type { BusyBlock } from "../types";
@@ -64,6 +71,7 @@ export default function Ingest() {
   const [rowsDirty, setRowsDirty] = useState(false);
   const [removedIds, setRemovedIds] = useState<string[]>([]);
   const [readOnly, setReadOnly] = useState(false);
+  const [busyReadOnly, setBusyReadOnly] = useState(true);
 
   const [lastCsvName, setLastCsvName] = useState<string | null>(null);
   const [csvSource, setCsvSource] = useState<"file" | "manual" | null>(null);
@@ -97,6 +105,7 @@ export default function Ingest() {
       setRows([]);
       setBusyBlocks([]);
       setUploadHistory([]);
+      setBusyReadOnly(true);
       return;
     }
     const assessmentsCol = collection(db, "users", uid, "assessments");
@@ -116,7 +125,10 @@ export default function Ingest() {
     });
 
     const unsubBusy = onSnapshot(busyCol, (snap) => {
-      const list = snap.docs.map((d) => d.data() as BusyBlock);
+      const list = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as BusyBlock),
+      }));
       list.sort(
         (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()
       );
@@ -167,17 +179,19 @@ export default function Ingest() {
   async function recordUpload(
     kind: "csv" | "ics",
     name: string,
-    source: "file" | "manual"
-  ) {
-    if (!uid) return;
+    source: "file" | "manual",
+    docRef?: ReturnType<typeof doc>
+  ): Promise<string | null> {
+    if (!uid) return null;
     const uploadsCol = collection(db, "users", uid, "ingestUploads");
-    const docRef = doc(uploadsCol);
-    await setDoc(docRef, {
+    const ref = docRef ?? doc(uploadsCol);
+    await setDoc(ref, {
       name,
       kind,
       source,
       uploadedAt: new Date().toISOString(),
     });
+    return ref.id;
   }
 
   async function handleCsvFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -353,15 +367,20 @@ export default function Ingest() {
     busyBlocks.forEach((block) => {
       uniqueBlocks.set(block.id, block);
     });
+    const uploadsCol = collection(db, "users", uid, "ingestUploads");
+    const uploadRef = lastIcsName ? doc(uploadsCol) : null;
     let newCount = 0;
     uniqueBlocks.forEach((block) => {
       const ref = doc(col, block.id);
-      batch.set(ref, block);
+      batch.set(ref, {
+        ...block,
+        sourceUploadId: uploadRef ? uploadRef.id : block.sourceUploadId ?? null,
+      });
       if (!existingIds.has(block.id)) newCount += 1;
     });
     await batch.commit();
-    if (lastIcsName) {
-      recordUpload("ics", lastIcsName, "file").catch(console.error);
+    if (lastIcsName && uploadRef) {
+      recordUpload("ics", lastIcsName, "file", uploadRef).catch(console.error);
       setLastIcsName(null);
     }
     alert(
@@ -378,6 +397,40 @@ export default function Ingest() {
     setBusyBlocks([]);
     setIcsConflicts([]);
   }
+
+async function deleteBusyBlock(blockId: string) {
+  if (!uid) return;
+  const confirmed = window.confirm("Remove this busy block?");
+  if (!confirmed) return;
+  try {
+    await deleteDoc(doc(db, "users", uid, "busy", blockId));
+  } catch (err: any) {
+    console.error("[Ingest] failed to delete busy block", err);
+    alert(err?.message || "Failed to delete busy block.");
+  }
+}
+
+async function deleteUploadRecord(record: UploadRecord) {
+  if (!uid) return;
+  const confirmed = window.confirm("Remove this upload entry?");
+  if (!confirmed) return;
+  try {
+    const related = savedBusyTimes.filter(
+      (block) => block.sourceUploadId === record.id
+    );
+    if (related.length) {
+      const batch = writeBatch(db);
+      related.forEach((block) =>
+        batch.delete(doc(db, "users", uid, "busy", block.id))
+      );
+      await batch.commit();
+    }
+    await deleteDoc(doc(db, "users", uid, "ingestUploads", record.id));
+  } catch (err: any) {
+    console.error("[Ingest] failed to delete upload record", err);
+    alert(err?.message || "Failed to delete record.");
+  }
+}
 
   function titleSlug(t: string) {
     return t
@@ -938,7 +991,7 @@ export default function Ingest() {
                     <span style={uploadHistoryLabel}>Recent calendars:</span>
                     <div style={uploadChipRow}>
                       {recentIcsUploads.map((upload) => (
-                        <span key={upload.id} style={uploadChip}>
+                        <span key={upload.id} style={{ ...uploadChip, position: "relative" }}>
                           <span>{upload.name}</span>
                           <span style={uploadChipMeta}>
                             {new Date(upload.uploadedAt).toLocaleString("en-AU", {
@@ -948,6 +1001,24 @@ export default function Ingest() {
                               minute: "2-digit",
                             })}
                           </span>
+                          {!busyReadOnly && (
+                            <button
+                              onClick={() => deleteUploadRecord(upload)}
+                              style={{
+                                position: "absolute",
+                                top: 6,
+                                right: 6,
+                                border: "none",
+                                background: "transparent",
+                                color: "#c2410c",
+                                cursor: "pointer",
+                                fontSize: "0.85rem",
+                              }}
+                              title="Remove record"
+                            >
+                              ✕
+                            </button>
+                          )}
                         </span>
                       ))}
                     </div>
@@ -975,12 +1046,23 @@ export default function Ingest() {
                   >
                     Saved busy times ({savedBusyTimes.length})
                   </h3>
-                  {savedBusyTimes.length > 0 && (
-                    <span style={{ color: "#64748b", fontSize: "0.9rem" }}>
-                      Showing {upcomingBusyPreview.length} upcoming block
-                      {upcomingBusyPreview.length === 1 ? "" : "s"}.
-                    </span>
-                  )}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {savedBusyTimes.length > 0 && (
+                      <span style={{ color: "#64748b", fontSize: "0.9rem" }}>
+                        Showing {upcomingBusyPreview.length} upcoming block
+                        {upcomingBusyPreview.length === 1 ? "" : "s"}.
+                      </span>
+                    )}
+                    <button
+                      onClick={() => setBusyReadOnly((prev) => !prev)}
+                      style={{
+                        ...mutedBtn,
+                        padding: "0.4rem 0.8rem",
+                      }}
+                    >
+                      {busyReadOnly ? "Unlock editing" : "Done editing"}
+                    </button>
+                  </div>
                 </div>
                 {savedBusyTimes.length ? (
                   <div
@@ -998,6 +1080,11 @@ export default function Ingest() {
                           <th className="th">Title</th>
                           <th className="th">Start</th>
                           <th className="th">End</th>
+                          {!busyReadOnly && (
+                            <th className="th" style={{ width: 90 }}>
+                              Actions
+                            </th>
+                          )}
                         </tr>
                       </thead>
                       <tbody>
@@ -1013,13 +1100,23 @@ export default function Ingest() {
                             <td className="td">
                               {new Date(block.end).toLocaleString("en-AU")}
                             </td>
+                            {!busyReadOnly && (
+                              <td className="td" style={{ width: 90 }}>
+                                <button
+                                  onClick={() => deleteBusyBlock(block.id)}
+                                  style={smallDanger}
+                                >
+                                  Remove
+                                </button>
+                              </td>
+                            )}
                           </tr>
                         ))}
                         {savedBusyTimes.length > upcomingBusyPreview.length && (
                           <tr>
                             <td
                               className="td"
-                              colSpan={3}
+                              colSpan={busyReadOnly ? 3 : 4}
                               style={{ color: "#64748b" }}
                             >
                               {savedBusyTimes.length -

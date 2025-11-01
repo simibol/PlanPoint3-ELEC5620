@@ -17,16 +17,45 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     const days = Math.max(1, Math.round((+due - +today) / 86_400_000));
 
     const simple = [
-      M("Topic & Research Plan", pct(days, 0.10), 2, assessment, today),
-      M("Research & Notes",      pct(days, 0.35), 6, assessment, today),
-      M("First Draft",           pct(days, 0.60), 6, assessment, today),
-      M("Revision & Proofread",  pct(days, 0.85), 3, assessment, today),
+      M(
+        "Topic & Research Plan",
+        pct(days, 0.1),
+        2,
+        assessment,
+        today,
+        "Outline theories to review and list databases you will search."
+      ),
+      M(
+        "Research & Notes",
+        pct(days, 0.35),
+        6,
+        assessment,
+        today,
+        "Read required literature and record evidence mapped to rubric criteria."
+      ),
+      M(
+        "First Draft",
+        pct(days, 0.6),
+        6,
+        assessment,
+        today,
+        "Draft each section following rubric headings and integrate references."
+      ),
+      M(
+        "Revision & Proofread",
+        pct(days, 0.85),
+        3,
+        assessment,
+        today,
+        "Revise structure, polish language, and verify rubric requirements."
+      ),
       {
         title: "Finalise & Submit",
         targetDate: assessment.dueDate,
         estimateHrs: 1,
         assessmentTitle: assessment.title,
         assessmentDueDate: assessment.dueDate,
+        description: "Complete formatting checklist, export final file, and submit."
       },
     ];
 
@@ -58,15 +87,16 @@ ${rubricSummary
 Produce between 6 and 10 milestone steps that explicitly cover these rubric expectations and spread the workload from now until the due date.
 
 Strict requirements for the JSON:
-1. Each milestone object must include "title", "offsetDays", and "estimateHrs".
+1. Each milestone object must include "title", "offsetDays", "estimateHrs", and "description".
 2. offsetDays are integers counting days from today (0 = today). They must be strictly increasing and the final milestone must have offsetDays = ${days}.
 3. Titles must be descriptive (≤ 70 characters) and map to the rubric sections or subsections (e.g. Part A.i Research, Part B Reflection). If the rubric lists major parts or criteria, provide at least one milestone for each part; include separate milestones for notable sub-parts where appropriate.
 4. estimateHrs must be between 1 and 12 and represent realistic effort; total hours should roughly scale with the assessment weight.
-5. Ensure the milestones collectively cover research/planning, drafting/building, synthesis, editing, and submission tasks aligned with the rubric. The target dates should progress steadily toward the deadline (e.g. research early, drafting mid-way, refinement shortly before submission, submission on the due date).
+5. description must be 1–3 sentences that state the concrete actions required for that milestone, referencing rubric criteria when relevant. Avoid generic text.
+6. Ensure the milestones collectively cover research/planning, drafting/building, synthesis, editing, and submission tasks aligned with the rubric. The target dates should progress steadily toward the deadline (e.g. research early, drafting mid-way, refinement shortly before submission, submission on the due date).
 
 Valid response shapes:
-- [ { "title": "...", "offsetDays": <int>, "estimateHrs": <int> }, ... ]
-- { "milestones": [ { "title": "...", "offsetDays": <int>, "estimateHrs": <int> }, ... ] }
+- [ { "title": "...", "offsetDays": <int>, "estimateHrs": <int>, "description": "..." }, ... ]
+- { "milestones": [ { "title": "...", "offsetDays": <int>, "estimateHrs": <int>, "description": "..." }, ... ] }
 `.trim();
 
     // ---- Call OpenAI with tiny retry/backoff on 429/5xx
@@ -110,6 +140,10 @@ Valid response shapes:
       estimateHrs: clamp(m?.estimateHrs ?? 2, 1, 24),
       assessmentTitle: assessment.title,
       assessmentDueDate: assessment.dueDate,
+      description:
+        typeof m?.description === "string"
+          ? m.description.trim()
+          : undefined,
     }));
 
     console.log("[AI] used OpenAI for:", assessment.title, "→", milestones.length, "items");
@@ -174,7 +208,8 @@ function M(
   offset: number,
   hrs: number,
   assessment: { title: string; dueDate: string },
-  start: Date
+  start: Date,
+  description?: string
 ) {
   return {
     title,
@@ -182,6 +217,7 @@ function M(
     estimateHrs: hrs,
     assessmentTitle: assessment.title,
     assessmentDueDate: assessment.dueDate,
+    description,
   };
 }
 function pct(days: number, p: number) { return Math.ceil(days * p); }

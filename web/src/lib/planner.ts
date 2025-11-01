@@ -281,16 +281,28 @@ const createSubtasks = (
 
   return segments.map((hours, index) => {
     const base = milestone.title.toLowerCase();
-    let notes = "";
-    if (base.includes("research") || base.includes("review")) {
-      notes = "Gather sources and capture notes in reference doc.";
-    } else if (base.includes("draft")) {
-      notes = "Focus on producing a rough draft; ignore polish for now.";
-    } else if (base.includes("edit") || base.includes("revise")) {
-      notes = "Work through feedback and tighten structure.";
-    } else if (base.includes("plan") || base.includes("outline")) {
-      notes = "Define sections, deliverables, and success criteria.";
+    const llmNotes = milestone.description?.trim();
+    let notes = llmNotes ?? "";
+    if (!notes) {
+      if (base.includes("research") || base.includes("review")) {
+        notes = "Gather sources and capture notes in reference doc.";
+      } else if (base.includes("draft")) {
+        notes = "Focus on producing a rough draft; ignore polish for now.";
+      } else if (base.includes("edit") || base.includes("revise")) {
+        notes = "Work through feedback and tighten structure.";
+      } else if (base.includes("plan") || base.includes("outline")) {
+        notes = "Define sections, deliverables, and success criteria.";
+      }
     }
+    const sessionNotesRaw =
+      segments.length === 1
+        ? notes
+        : notes
+        ? index === 0
+          ? notes
+          : `Continue: ${notes}`
+        : "";
+    const sessionNotes = sessionNotesRaw ?? "";
 
     const subtaskTitle =
       segments.length === 1
@@ -304,7 +316,7 @@ const createSubtasks = (
       milestoneTitle: milestone.title,
       subtaskTitle,
       durationHours: Number(hours.toFixed(2)),
-      notes,
+      notes: sessionNotes,
       order: index,
       dueDate,
       weightScore: importance,
@@ -430,14 +442,18 @@ const scheduleSubtasks = (
     }
 
     const targetDay = chosen || fallback?.day || null;
-    const riskLevel: "on-track" | "warning" | "at-risk" =
-      !targetDay || parseDateKey(targetDay.date).getTime() > dueTs
-        ? "at-risk"
-        : Math.abs(
-            parseDateKey(targetDay.date).getTime() - dueTs
-          ) <= MS_PER_DAY
-        ? "warning"
-        : "on-track";
+    let riskLevel: "on-track" | "warning" | "at-risk";
+    if (!targetDay) {
+      riskLevel = "at-risk";
+    } else {
+      const scheduledTs = parseDateKey(targetDay.date).getTime();
+      if (scheduledTs > dueTs) {
+        const deltaDays = Math.round((scheduledTs - dueTs) / MS_PER_DAY);
+        riskLevel = deltaDays <= 1 ? "warning" : "at-risk";
+      } else {
+        riskLevel = "on-track";
+      }
+    }
 
     if (!targetDay) {
       warnings.push({
@@ -558,11 +574,13 @@ const scheduleSubtasks = (
       warnings.push({
         type: riskLevel === "warning" ? "deadline" : "capacity",
         message: `"${sub.subtaskTitle}" is scheduled ${
-          riskLevel === "warning" ? "on its due date" : "after its due date"
+          riskLevel === "warning"
+            ? "the day after its due date"
+            : "after its due date"
         }.`,
         detail:
           riskLevel === "warning"
-            ? "Consider starting earlier to leave review time."
+            ? "Consider pulling this forward so you finish on or before the deadline."
             : "Increase daily capacity or extend availability to avoid lateness.",
       });
     }

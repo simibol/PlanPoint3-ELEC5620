@@ -20,6 +20,7 @@ export type Milestone = {
   estimateHrs?: number;
   assessmentTitle: string;
   assessmentDueDate?: string;
+  description?: string;
 };
 
 export type BusyBlock = {
@@ -27,6 +28,7 @@ export type BusyBlock = {
   title: string;
   start: string;
   end: string;
+  sourceUploadId?: string | null;
 };
 
 export type PlannerPreferences = {
