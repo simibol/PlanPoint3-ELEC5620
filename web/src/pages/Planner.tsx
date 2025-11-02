@@ -103,6 +103,16 @@ const getPreferenceWindowError = (prefs: PlannerPreferences) => {
   return available < prefs.dailyCapHours ? PREF_WINDOW_ERROR : null;
 };
 
+type CatchupChange = {
+  id: string;
+  assessmentTitle: string;
+  subtaskTitle: string;
+  oldDate: string;
+  oldTime: string;
+  newDate: string;
+  newTime: string;
+};
+
 const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
 
 // --- date formatting helpers (AU) ---
@@ -301,6 +311,7 @@ export default function Planner() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [prefError, setPrefError] = useState<string | null>(null);
   const [catchupMessage, setCatchupMessage] = useState<string | null>(null);
+  const [catchupChanges, setCatchupChanges] = useState<CatchupChange[]>([]);
 
   // week paging for calendar preview
   const [weekStartIndex, setWeekStartIndex] = useState(0);
@@ -751,6 +762,7 @@ export default function Planner() {
   };
 
   const handleManualCatchup = useCallback(() => {
+    setCatchupChanges([]);
     if (!plan) {
       setCatchupMessage("Generate a plan before running catch-up.");
       return;
@@ -773,16 +785,62 @@ export default function Planner() {
         setCatchupMessage(
           "Catch-up couldn’t find space before deadlines. Expand your availability and try again."
         );
+        setCatchupChanges([]);
         return;
       }
+      let diff: CatchupChange[] = [];
       setPlan((prev) => {
         if (!prev) return prev;
-        return mergeRescheduledPlan(prev, res, preferences);
+        const merged = mergeRescheduledPlan(prev, res, preferences);
+        const before = new Map(
+          prev.sessions.map((session) => [
+            session.id,
+            {
+              date: session.date,
+              start: session.startTime,
+              end: session.endTime,
+              assessmentTitle: session.assessmentTitle,
+              subtaskTitle: session.subtaskTitle,
+            },
+          ])
+        );
+        diff = merged.sessions
+          .map((session) => {
+            const prior = before.get(session.id);
+            if (
+              !prior ||
+              (prior.date === session.date &&
+                prior.start === session.startTime &&
+                prior.end === session.endTime)
+            ) {
+              return null;
+            }
+            const oldTime = `${formatTime12(prior.start)}–${formatTime12(
+              prior.end
+            )}`;
+            const newTime = `${formatTime12(session.startTime)}–${formatTime12(
+              session.endTime
+            )}`;
+            return {
+              id: session.id,
+              assessmentTitle: session.assessmentTitle,
+              subtaskTitle: session.subtaskTitle,
+              oldDate: shortDate(prior.date),
+              oldTime,
+              newDate: shortDate(session.date),
+              newTime,
+            } as CatchupChange;
+          })
+          .filter((item): item is CatchupChange => Boolean(item));
+        return merged;
       });
+      setCatchupChanges(diff);
       setCatchupMessage(
-        `Catch-up rescheduled ${res.sessions.length} session${
-          res.sessions.length === 1 ? "" : "s"
-        }. Apply to calendar to commit the changes.`
+        diff.length
+          ? `Catch-up moved ${diff.length} session${
+              diff.length === 1 ? "" : "s"
+            }. Review the changes below, then apply to your calendar.`
+          : `Catch-up ran, but every session was already in the earliest slot available.`
       );
       if (
         res.unplaced.length ||
@@ -1182,13 +1240,64 @@ export default function Planner() {
             <div
               style={{
                 marginTop: "0.75rem",
-                padding: "0.7rem",
+                padding: "0.75rem 0.8rem",
                 borderRadius: 10,
                 background: "#fef9c3",
                 color: "#92400e",
+                display: "grid",
+                gap: "0.6rem",
               }}
             >
-              {catchupMessage}
+              <div>{catchupMessage}</div>
+              {catchupChanges.length > 0 && plan && (
+                <button
+                  onClick={handleApply}
+                  disabled={busy}
+                  style={{
+                    justifySelf: "flex-start",
+                    padding: "0.55rem 0.9rem",
+                    borderRadius: 8,
+                    border: "none",
+                    background: busy
+                      ? "#fde047"
+                      : "linear-gradient(135deg,#f59e0b 0%,#d97706 100%)",
+                    color: "white",
+                    fontWeight: 600,
+                    cursor: busy ? "not-allowed" : "pointer",
+                    boxShadow: "0 6px 16px rgba(234,179,8,0.25)",
+                  }}
+                >
+                  Apply updated plan
+                </button>
+              )}
+            </div>
+          )}
+          {catchupChanges.length > 0 && (
+            <div
+              style={{
+                marginTop: "0.6rem",
+                border: "1px solid #bfdbfe",
+                borderRadius: 10,
+                background: "#eff6ff",
+                color: "#1e3a8a",
+                padding: "0.75rem 0.85rem",
+                display: "grid",
+                gap: "0.5rem",
+              }}
+            >
+              <div style={{ fontWeight: 600 }}>Catch-up adjustments</div>
+              <ul style={{ margin: 0, paddingLeft: "1.1rem", display: "grid", gap: "0.4rem", fontSize: "0.88rem" }}>
+                {catchupChanges.map((change) => (
+                  <li key={change.id}>
+                    <div style={{ fontWeight: 600 }}>{change.subtaskTitle}</div>
+                    <div>
+                      {change.assessmentTitle} • {change.oldDate} {change.oldTime}
+                      {" → "}
+                      {change.newDate} {change.newTime}
+                    </div>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
           {unplacedCount > 0 && (
