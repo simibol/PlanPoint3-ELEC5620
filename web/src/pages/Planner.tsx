@@ -208,6 +208,42 @@ function summariseSessions(
     });
 }
 
+function mergeRescheduledPlan(
+  basePlan: PlanResult,
+  res: PlanResult,
+  prefs: PlannerPreferences
+): PlanResult {
+  const replacements = new Map(res.sessions.map((s) => [s.id, s]));
+  const mergedSessions = basePlan.sessions.map((session) => {
+    const updated = replacements.get(session.id);
+    if (!updated) return session;
+    return {
+      ...session,
+      ...updated,
+    };
+  });
+  // include any brand-new sessions (should be rare)
+  res.sessions.forEach((session) => {
+    if (!mergedSessions.find((s) => s.id === session.id)) {
+      mergedSessions.push(session);
+    }
+  });
+  const sortedSessions = mergedSessions
+    .slice()
+    .sort((a, b) =>
+      a.date.localeCompare(b.date) ||
+      a.startTime.localeCompare(b.startTime) ||
+      a.id.localeCompare(b.id)
+    );
+  return {
+    sessions: sortedSessions,
+    days: summariseSessions(sortedSessions, prefs),
+    warnings: res.warnings.length ? res.warnings : basePlan.warnings,
+    unplaced: res.unplaced.length ? res.unplaced : basePlan.unplaced,
+    version: basePlan.version ?? Date.now(),
+  };
+}
+
 // --- risk pill UI color ---
 function riskColors(risk: PlannedSession["riskLevel"]) {
   switch (risk) {
@@ -397,6 +433,16 @@ export default function Planner() {
     return map;
   }, [assessments]);
 
+  const unplacedMilestoneKeys = useMemo(() => {
+    if (!plan?.unplaced?.length) return new Set<string>();
+    return new Set(
+      plan.unplaced.map(
+        (session) => `${session.assessmentTitle}|${session.milestoneTitle}`
+      )
+    );
+  }, [plan]);
+  const unplacedCount = plan?.unplaced?.length ?? 0;
+
   const lastPlanSignatureRef = useRef<string | null>(null);
   const catchupSignatureRef = useRef<string | null>(null);
 
@@ -471,33 +517,10 @@ export default function Planner() {
       return;
     }
 
-    const replacements = new Map(res.sessions.map((s) => [s.id, s]));
-    const merged = plan.sessions.map((session) => {
-      const updated = replacements.get(session.id);
-      if (!updated) return session;
-      return {
-        ...session,
-        ...updated,
-        status: session.status,
-      };
+    setPlan((prevPlan) => {
+      if (!prevPlan) return prevPlan;
+      return mergeRescheduledPlan(prevPlan, res, preferences);
     });
-    const sorted = merged
-      .slice()
-      .sort((a, b) =>
-        a.date.localeCompare(b.date) ||
-        a.startTime.localeCompare(b.startTime) ||
-        a.id.localeCompare(b.id)
-      );
-
-    const warnings = res.warnings.length ? res.warnings : plan.warnings;
-    const mergedPlan: PlanResult = {
-      sessions: sorted,
-      days: summariseSessions(sorted, preferences),
-      warnings,
-      unplaced: res.unplaced.length ? res.unplaced : plan.unplaced,
-      version: plan.version ?? Date.now(),
-    };
-    setPlan(mergedPlan);
     setCatchupMessage(
       `Rolled ${res.sessions.length} overdue session${
         res.sessions.length === 1 ? "" : "s"
@@ -696,6 +719,53 @@ export default function Planner() {
     }
   };
 
+  const handleManualCatchup = useCallback(() => {
+    if (!plan) {
+      setCatchupMessage("Generate a plan before running catch-up.");
+      return;
+    }
+    const todayIso = toIsoDate(new Date());
+    const overdue = plan.sessions.filter(
+      (session) => !isDone(session.status) && session.date < todayIso
+    );
+    if (!overdue.length) {
+      setCatchupMessage("All sessions are already scheduled on or after today.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = rescheduleSessions(overdue, preferences, {
+        startDate: new Date(),
+        busyBlocks,
+      });
+      if (!res.sessions.length) {
+        setCatchupMessage(
+          "Catch-up couldn’t find space before deadlines. Expand your availability and try again."
+        );
+        return;
+      }
+      setPlan((prev) => {
+        if (!prev) return prev;
+        return mergeRescheduledPlan(prev, res, preferences);
+      });
+      setCatchupMessage(
+        `Catch-up rescheduled ${res.sessions.length} session${
+          res.sessions.length === 1 ? "" : "s"
+        }. Apply to calendar to commit the changes.`
+      );
+      if (
+        res.unplaced.length ||
+        res.warnings.some((warn) => warn.type === "capacity")
+      ) {
+        setCatchupMessage((msg) =>
+          `${msg ?? ""} Some work still needs attention—consider more availability.`
+        );
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [plan, preferences, busyBlocks]);
+
   // Toggle a session's completion (persist to Firestore if applied)
   const toggleDone = useCallback(
     async (sessionId: string, next: boolean) => {
@@ -892,7 +962,7 @@ export default function Planner() {
               value={preferences.dailyCapHours}
               onChange={(val) => updatePref("dailyCapHours", val)}
               min={1}
-              max={12}
+              max={24}
             />
             <TimeField
               label="Day start"
@@ -907,6 +977,11 @@ export default function Planner() {
               onChange={(val) => updatePref("endHour", val)}
               min={5}
               max={24}
+            />
+            <ToggleField
+              label="Allow weekends"
+              checked={preferences.allowWeekends}
+              onChange={(val) => updatePref("allowWeekends", val)}
             />
           </div>
 
@@ -985,7 +1060,7 @@ export default function Planner() {
           </button>
 
           <button
-            onClick={() => navigate("/progress?catchup=1")}
+            onClick={handleManualCatchup}
             style={{
               marginTop: "0.65rem",
               width: "100%",
@@ -1049,6 +1124,23 @@ export default function Planner() {
               {catchupMessage}
             </div>
           )}
+          {unplacedCount > 0 && (
+            <div
+              style={{
+                marginTop: "0.75rem",
+                padding: "0.7rem",
+                borderRadius: 10,
+                background: "#fee2e2",
+                color: "#b91c1c",
+                fontSize: "0.85rem",
+              }}
+            >
+              ⚠️ Unable to schedule {unplacedCount} session
+              {unplacedCount === 1 ? "" : "s"} before their deadlines. Extend your
+              working window, raise the daily focus cap, or allow weekends, then
+              regenerate.
+            </div>
+          )}
 
           {/* Milestones overview (collapsed list) */}
           <div style={{ marginTop: "1rem" }}>
@@ -1092,6 +1184,9 @@ export default function Planner() {
                         </div>
                         <div style={{ marginTop: "0.35rem", display: "grid", gap: "0.35rem" }}>
                           {sorted.map((m) => {
+                            const atRisk = unplacedMilestoneKeys.has(
+                              `${m.assessmentTitle}|${m.title}`
+                            );
                             const targetDate =
                               parseFlexibleDate(m.targetDate) ??
                               parseFlexibleDate(m.assessmentDueDate);
@@ -1106,7 +1201,7 @@ export default function Planner() {
                             const estimateLabel =
                               m.estimateHrs != null
                                 ? `${m.estimateHrs.toFixed(1)}h`
-                                : "n/a";
+                              : "n/a";
                             return (
                               <div
                                 key={m.id || `${m.title}-${m.targetDate}`}
@@ -1116,9 +1211,9 @@ export default function Planner() {
                                   justifyContent: "space-between",
                                   gap: "0.5rem",
                                   padding: "0.45rem 0.55rem",
-                                  border: "1px solid #e2e8f0",
+                                  border: atRisk ? "1px solid #f87171" : "1px solid #e2e8f0",
                                   borderRadius: 8,
-                                  background: "#f8fafc",
+                                  background: atRisk ? "#fef2f2" : "#f8fafc",
                                 }}
                               >
                                 <div>
@@ -1126,7 +1221,7 @@ export default function Planner() {
                                     style={{
                                       fontSize: "0.9rem",
                                       fontWeight: 600,
-                                      color: "#0f172a",
+                                      color: atRisk ? "#b91c1c" : "#0f172a",
                                     }}
                                   >
                                     {m.title}
@@ -1134,11 +1229,22 @@ export default function Planner() {
                                   <div
                                     style={{
                                       fontSize: "0.8rem",
-                                      color: "#475569",
+                                      color: atRisk ? "#dc2626" : "#475569",
                                     }}
                                   >
                                     Target {targetLabel} • Est. {estimateLabel}
                                   </div>
+                                  {atRisk && (
+                                    <div
+                                      style={{
+                                        fontSize: "0.72rem",
+                                        fontWeight: 600,
+                                        color: "#b91c1c",
+                                      }}
+                                    >
+                                      Needs more capacity before due date
+                                    </div>
+                                  )}
                                 </div>
                                 <button
                                   onClick={() => handleDeleteMilestone(m)}
@@ -1639,7 +1745,7 @@ function TimeField({
   min: number;
   max: number;
 }) {
-  const inputValue = toTimeInputValue(value);
+  const display = toTimeInputValue(value);
   return (
     <label
       style={{
@@ -1651,32 +1757,44 @@ function TimeField({
       }}
     >
       {label}
-      <input
-        type="time"
-        value={inputValue}
-        step={900}
-        onChange={(e) => {
-          const parsed = fromTimeInputValue(e.target.value);
-          if (Number.isFinite(parsed)) {
-            const clamped = Math.min(max, Math.max(min, parsed));
-            onChange(clamped);
-          }
-        }}
+      <div
         style={{
-          padding: "0.55rem 0.65rem",
-          borderRadius: 8,
-          border: "1px solid #cbd5e1",
-          fontSize: "0.95rem",
+          display: "flex",
+          alignItems: "center",
+          gap: "0.5rem",
         }}
-      />
+      >
+        <input
+          type="time"
+          value={display}
+          step={900}
+          onChange={(e) => {
+            const parsed = fromTimeInputValue(e.target.value);
+            if (Number.isFinite(parsed)) {
+              const clamped = Math.min(max, Math.max(min, parsed));
+              onChange(clamped);
+            }
+          }}
+          style={{
+            padding: "0.55rem 0.65rem",
+            borderRadius: 8,
+            border: "1px solid #cbd5e1",
+            fontSize: "0.95rem",
+          }}
+        />
+        <div style={{ fontSize: "0.8rem", color: "#64748b" }}>
+          {formatDisplayTime(value)}
+        </div>
+      </div>
     </label>
   );
 }
 
 function toTimeInputValue(hour: number) {
-  const base = Math.floor(hour);
-  const minutes = Math.round((hour - base) * 60);
-  return `${String((base + 24) % 24).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+  const normalized = ((hour % 24) + 24) % 24;
+  const base = Math.floor(normalized);
+  const minutes = Math.round((normalized - base) * 60);
+  return `${String(base).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
 function fromTimeInputValue(value: string) {
@@ -1684,6 +1802,51 @@ function fromTimeInputValue(value: string) {
   const [h, m] = value.split(":").map(Number);
   if (!Number.isFinite(h) || !Number.isFinite(m)) return NaN;
   return h + m / 60;
+}
+
+function formatDisplayTime(hour: number) {
+  const normalized = ((hour % 24) + 24) % 24;
+  const base = Math.floor(normalized);
+  const minutes = Math.round((normalized - base) * 60);
+  const period = base >= 12 ? "pm" : "am";
+  const displayHour = base % 12 === 0 ? 12 : base % 12;
+  return `${String(displayHour).padStart(2, "0")}:${String(minutes).padStart(
+    2,
+    "0"
+  )} ${period}`;
+}
+
+function ToggleField({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (val: boolean) => void;
+}) {
+  return (
+    <label
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        padding: "0.55rem 0.65rem",
+        borderRadius: 8,
+        border: "1px solid #cbd5e1",
+        fontSize: "0.9rem",
+        color: "#0f172a",
+      }}
+    >
+      {label}
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ width: 18, height: 18, cursor: "pointer" }}
+      />
+    </label>
+  );
 }
 
 function TimeColumn({ labels }: { labels: string[] }) {
