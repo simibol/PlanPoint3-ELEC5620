@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth, db, storage } from "../firebase";
 import {
@@ -30,6 +31,8 @@ type UploadRecord = {
   source: "file" | "manual";
 };
 
+const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
+
 let pdfWorkerSingleton: Worker | null = null;
 if (typeof window !== "undefined") {
   pdfWorkerSingleton = new PdfWorker();
@@ -53,6 +56,7 @@ const emptyAssessment = (): EditableAssessment => ({
 });
 
 export default function Ingest() {
+  const navigate = useNavigate();
   const [uid, setUid] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("csv");
 
@@ -333,7 +337,7 @@ export default function Ingest() {
           );
         } catch (cascadeError) {
           console.error(
-            "[Ingest] failed to remove linked data for deleted assessments",
+            "[Schedule] failed to remove linked data for deleted assessments",
             cascadeError
           );
         }
@@ -353,8 +357,6 @@ export default function Ingest() {
       setCsvSource(null);
       setLastCsvName(null);
 
-      alert(`Saved ${valid.length} assessment(s). Go to Milestones next.`);
-
       if (dueDateChanges.length) {
         const uniqueRefresh = Array.from(
           new Map(
@@ -371,13 +373,14 @@ export default function Ingest() {
           );
         } catch (cascadeError) {
           console.error(
-            "[Ingest] failed to refresh milestones for due-date changes",
+            "[Schedule] failed to refresh milestones for due-date changes",
             cascadeError
           );
         }
       }
+      navigate("/milestones");
     } catch (err: any) {
-      console.error("[Ingest] failed to save assessments", err);
+      console.error("[Schedule] failed to save assessments", err);
       alert(err?.message || "Failed to save assessments.");
     }
   }
@@ -405,40 +408,27 @@ export default function Ingest() {
     if (!busyBlocks.length) return alert("No busy times to save.");
     const col = collection(db, "users", uid, "busy");
     const batch = writeBatch(db);
-    const existingIds = new Set(savedBusyTimes.map((b) => b.id));
     const uniqueBlocks = new Map<string, BusyBlock>();
     busyBlocks.forEach((block) => {
       uniqueBlocks.set(block.id, block);
     });
     const uploadsCol = collection(db, "users", uid, "ingestUploads");
     const uploadRef = lastIcsName ? doc(uploadsCol) : null;
-    let newCount = 0;
     uniqueBlocks.forEach((block) => {
       const ref = doc(col, block.id);
       batch.set(ref, {
         ...block,
         sourceUploadId: uploadRef ? uploadRef.id : block.sourceUploadId ?? null,
       });
-      if (!existingIds.has(block.id)) newCount += 1;
     });
     await batch.commit();
     if (lastIcsName && uploadRef) {
       recordUpload("ics", lastIcsName, "file", uploadRef).catch(console.error);
       setLastIcsName(null);
     }
-    alert(
-      `Saved ${uniqueBlocks.size} busy block(s).` +
-        (newCount
-          ? ` Added ${newCount} new event${newCount === 1 ? "" : "s"}.`
-          : "") +
-        (icsConflicts.length
-          ? ` ${icsConflicts.length} overlap${
-              icsConflicts.length === 1 ? "" : "s"
-            } detected with existing busy times.`
-          : "")
-    );
     setBusyBlocks([]);
     setIcsConflicts([]);
+    navigate("/planner");
   }
 
 async function deleteBusyBlock(blockId: string) {
@@ -448,7 +438,7 @@ async function deleteBusyBlock(blockId: string) {
   try {
     await deleteDoc(doc(db, "users", uid, "busy", blockId));
   } catch (err: any) {
-    console.error("[Ingest] failed to delete busy block", err);
+    console.error("[Schedule] failed to delete busy block", err);
     alert(err?.message || "Failed to delete busy block.");
   }
 }
@@ -470,25 +460,52 @@ async function deleteUploadRecord(record: UploadRecord) {
     }
     await deleteDoc(doc(db, "users", uid, "ingestUploads", record.id));
   } catch (err: any) {
-    console.error("[Ingest] failed to delete upload record", err);
+    console.error("[Schedule] failed to delete upload record", err);
     alert(err?.message || "Failed to delete record.");
   }
 }
 
-  function titleSlug(t: string) {
-    return t
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "");
-  }
+function titleSlug(t: string) {
+  return t
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
+
+function HeaderChip({
+  label,
+  value,
+  subtle,
+}: {
+  label: string;
+  value: string;
+  subtle?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        padding: "0.75rem 1rem",
+        borderRadius: 14,
+        background: subtle ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.3)",
+        color: "white",
+        minWidth: 160,
+        display: "grid",
+        gap: "0.35rem",
+      }}
+    >
+      <span style={{ fontSize: "0.78rem", opacity: 0.85 }}>{label}</span>
+      <span style={{ fontSize: "1.25rem", fontWeight: 700 }}>{value}</span>
+    </div>
+  );
+}
 
   // ---------- UI ----------
   return (
     <div
       style={{
         minHeight: "100vh",
-        background: "#f5f7ff",
-        padding: "2.5rem 1.2rem",
+        background: APP_BACKGROUND,
+        padding: "2.5rem 1.5rem",
       }}
     >
       <div
@@ -496,26 +513,65 @@ async function deleteUploadRecord(record: UploadRecord) {
           maxWidth: 1200,
           margin: "0 auto",
           background: "white",
-          borderRadius: 16,
-          boxShadow: "0 18px 40px rgba(56,76,126,0.12)",
+          borderRadius: 20,
+          boxShadow: "0 26px 48px rgba(15,23,42,0.2)",
           overflow: "hidden",
         }}
       >
-        {/* Header */}
-        <div
+        <header
           style={{
-            background: "linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%)",
+            background: "linear-gradient(135deg,#1d4ed8 0%,#4f46e5 100%)",
             color: "white",
-            padding: "1.8rem",
+            padding: "2rem",
           }}
         >
-          <h1 style={{ margin: 0 }}>Ingest (Assessments & Busy Times)</h1>
-          <p style={{ margin: "0.25rem 0 0 0", opacity: 0.9 }}>
-            <strong>CSV</strong> → <strong>Assessments</strong> (editable).{" "}
-            <strong>ICS</strong> → <strong>Busy blocks</strong> only (used to
-            avoid scheduling).
-          </p>
-        </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+            <div
+              style={{
+                width: 56,
+                height: 56,
+                borderRadius: 16,
+                background: "rgba(255,255,255,0.2)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: "26px",
+              }}
+            >
+              📅
+            </div>
+            <div>
+              <h1 style={{ margin: 0, fontSize: "2rem", letterSpacing: "-0.02em" }}>
+                Schedule Ingestion
+              </h1>
+              <p style={{ margin: "0.35rem 0 0 0", opacity: 0.85, fontSize: "1rem" }}>
+                Import assessments and availability so Planner can respect every commitment.
+              </p>
+            </div>
+          </div>
+          <div
+            style={{
+              marginTop: "1.6rem",
+              display: "flex",
+              gap: "1.25rem",
+              flexWrap: "wrap",
+            }}
+          >
+            <HeaderChip
+              label="Assessments saved"
+              value={savedAssessments.length.toString()}
+            />
+            <HeaderChip
+              label="Availability blocks"
+              value={savedBusyTimes.length.toString()}
+            />
+            <HeaderChip
+              label="Recent uploads"
+              value={uploadHistory.length ? uploadHistory[0].name : "None yet"}
+              subtle
+            />
+          </div>
+        </header>
 
         {/* Tabs */}
         <div style={{ padding: "1rem 1.25rem 0 1.25rem" }}>
@@ -525,14 +581,14 @@ async function deleteUploadRecord(record: UploadRecord) {
               style={tabBtnStyle(tab === "csv")}
               aria-pressed={tab === "csv"}
             >
-              📊 CSV (Assessments)
+              📊 Assessments (CSV)
             </button>
             <button
               onClick={() => setTab("ics")}
               style={tabBtnStyle(tab === "ics")}
               aria-pressed={tab === "ics"}
             >
-              📅 ICS (Busy times)
+              📅 Availability (ICS)
             </button>
           </div>
         </div>
@@ -1333,7 +1389,7 @@ async function extractPdfText(file: File): Promise<string> {
     const normalised = combined.replace(/\s+/g, " ").trim();
     return normalised.slice(0, 20000);
   } catch (err) {
-    console.error("[Ingest] Failed to extract PDF text", err);
+    console.error("[Schedule] Failed to extract PDF text", err);
     return "";
   }
 }

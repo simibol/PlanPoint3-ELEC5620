@@ -103,6 +103,8 @@ const getPreferenceWindowError = (prefs: PlannerPreferences) => {
   return available < prefs.dailyCapHours ? PREF_WINDOW_ERROR : null;
 };
 
+const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
+
 // --- date formatting helpers (AU) ---
 function parseFlexibleDate(input?: string | null): Date | null {
   if (!input) return null;
@@ -723,13 +725,6 @@ export default function Planner() {
       setPrefError(message);
       return;
     }
-    const confirmReplace =
-      activePlanCount === 0 ||
-      window.confirm(
-        "This will replace your existing calendar plan. Continue?"
-      );
-    if (!confirmReplace) return;
-
     setBusy(true);
     setError(null);
     try {
@@ -924,7 +919,7 @@ export default function Planner() {
     <div
       style={{
         minHeight: "100vh",
-        background: "linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%)",
+        background: APP_BACKGROUND,
         padding: "1.25rem",
       }}
     >
@@ -971,7 +966,7 @@ export default function Planner() {
           <MetricTile
             label="Milestones ready"
             value={milestones.length.toString()}
-            helper="Saved from Ingest"
+            helper="Saved from Schedule Ingestion"
           />
           <MetricTile
             label="Active plan sessions"
@@ -1434,10 +1429,9 @@ export default function Planner() {
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "auto repeat(7, minmax(220px, 1fr))",
+                    gridTemplateColumns: "120px repeat(7, minmax(210px, 1fr))",
                     gap: "1rem",
                     marginTop: "0.75rem",
-                    minWidth: "calc(220px * 7 + 140px)",
                   }}
                 >
                   <TimeColumn labels={timeLabels} height={columnHeight} />
@@ -1562,7 +1556,7 @@ function EmptyPlannerGuide({ onStart }: { onStart: () => void }) {
           boxShadow: "0 10px 24px rgba(99,102,241,0.35)",
         }}
       >
-        Go to Ingest
+        Go to Schedule Ingestion
       </button>
     </div>
   );

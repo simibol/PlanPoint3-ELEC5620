@@ -15,9 +15,9 @@ export default function App() {
       <p>Welcome, {u.displayName || u.email}</p>
       <nav style={{ display: "flex", gap: 12 }}>
         <Link to="/">Home</Link>
-        <Link to="/ingest">Upload Schedule (UC1)</Link>
-        <Link to="/milestones">Milestones (UC2)</Link>
-        <Link to="/planner">Auto Planner (UC3)</Link>
+        <Link to="/ingest">Schedule Ingestion</Link>
+        <Link to="/milestones">Milestones</Link>
+        <Link to="/planner">Planner</Link>
       </nav>
     </div>
   );

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { auth, db } from "../firebase";
 import {
   collection,
@@ -21,7 +22,10 @@ type MilestonesResponse = {
 const makeAssessmentKey = (title: string, dueDate?: string) =>
   `${title.trim().toLowerCase()}|${dueDate ? new Date(dueDate).toISOString() : ""}`;
 
+const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
+
 export default function Milestones() {
+  const navigate = useNavigate();
   const [assessments, setAssessments] = useState<Assessment[]>([]);
   const [selected, setSelected] = useState<Assessment | null>(null);
   const [draft, setDraft] = useState<Milestone[] | null>(null);
@@ -156,17 +160,27 @@ export default function Milestones() {
         )
       );
     }
-    if (selectedAssessment) {
-      const key = makeAssessmentKey(selectedAssessment.title, selectedAssessment.dueDate);
-      setGeneratedFor((prev) => {
-        const next = new Set(prev);
-        next.add(key);
-        return next;
-      });
-    }
-    alert("Milestones saved!");
+    const key = makeAssessmentKey(
+      selectedAssessment?.title ?? targetTitle,
+      selectedAssessment?.dueDate ?? draft[0].assessmentDueDate
+    );
+    const updatedGenerated = new Set(generatedFor);
+    updatedGenerated.add(key);
+    setGeneratedFor(updatedGenerated);
+
     setDraft(null);
     setSelected(null);
+
+    const allGenerated =
+      assessments.length > 0 &&
+      assessments.every((assessment) =>
+        updatedGenerated.has(
+          makeAssessmentKey(assessment.title, assessment.dueDate)
+        )
+      );
+    if (allGenerated) {
+      navigate("/planner");
+    }
   }
 
   // Helper function to get days until due date
@@ -229,7 +243,7 @@ export default function Milestones() {
   return (
     <div style={{ 
       minHeight: '100vh',
-      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+      background: APP_BACKGROUND,
       padding: '2rem 1rem'
     }}>
       <div style={{ 
@@ -301,7 +315,7 @@ export default function Milestones() {
                 color: '#6b7280',
                 fontSize: '1rem'
               }}>
-                Upload your assessments on the Ingest page first to generate milestones.
+                Upload your assessments on the Schedule Ingestion page first to generate milestones.
               </p>
             </div>
           ) : (

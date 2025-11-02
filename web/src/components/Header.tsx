@@ -30,7 +30,7 @@ export default function Header() {
       </Link>
       <nav style={{ display: "flex", gap: "1rem" }}>
         <NavLink to="/">Home</NavLink>
-        <NavLink to="/ingest">Ingest</NavLink>
+        <NavLink to="/ingest">Schedule Ingestion</NavLink>
         <NavLink to="/milestones">Milestones</NavLink>
         <NavLink to="/planner">Planner</NavLink>
       </nav>

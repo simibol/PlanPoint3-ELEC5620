@@ -46,6 +46,8 @@ const formatTime12 = (time: string) => {
 const formatTimeRange = (session: PlannedSession) =>
   `${formatTime12(session.startTime)} – ${formatTime12(session.endTime)}`;
 
+const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
+
 export default function ProgressDashboard({
   allowToggle = true,
   showGreeting = false,
@@ -248,6 +250,7 @@ export default function ProgressDashboard({
   const overallPercent = sessions.length
     ? Math.round((totalCompletedSessions / sessions.length) * 100)
     : 100;
+  const showEmptyState = sessions.length === 0 && assessments.length === 0;
 
   if (!uid) return null;
 
@@ -263,7 +266,7 @@ export default function ProgressDashboard({
     <div
       style={{
         minHeight: "100vh",
-        background: "linear-gradient(135deg, #10b981 0%, #2563eb 100%)",
+        background: APP_BACKGROUND,
         padding: "2rem 1.5rem",
       }}
     >
@@ -371,6 +374,39 @@ export default function ProgressDashboard({
               }}
             >
               {error}
+            </div>
+          )}
+
+          {showEmptyState && (
+            <div
+              style={{
+                border: "1px solid #bfdbfe",
+                background: "#eff6ff",
+                color: "#1e3a8a",
+                borderRadius: "14px",
+                padding: "1.25rem",
+                marginBottom: "2rem",
+                display: "grid",
+                gap: "0.5rem",
+              }}
+            >
+              <div style={{ fontWeight: 700, fontSize: "1rem" }}>
+                Kick-start your study plan
+              </div>
+              <div style={{ fontSize: "0.9rem" }}>
+                Upload assessments and availability in{" "}
+                <Link
+                  to="/ingest"
+                  style={{
+                    fontWeight: 600,
+                    color: "#1d4ed8",
+                    textDecoration: "none",
+                  }}
+                >
+                  Schedule Ingestion
+                </Link>{" "}
+                to populate milestones and planner sessions.
+              </div>
             </div>
           )}
 
