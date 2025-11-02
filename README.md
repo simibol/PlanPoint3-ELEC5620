@@ -78,6 +78,8 @@ npx wrangler pages deploy --project-name planpoint --branch main
 
 Ensure the Cloudflare project mirrors `.env.local` values.
 
+Anyone can then run the PlanPoint web application through this link: https://planpoint3-elec5620.pages.dev
+
 ---
 
 ## 5. Advanced Technologies
