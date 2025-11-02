@@ -41,7 +41,7 @@ npx wrangler pages dev --proxy 5173 --compatibility-date=2025-10-15
 | --- | --- |
 | **Schedule Ingestion (UC1)** | Upload CSV assessment schedules, attach PDF specs/rubrics, import ICS availability, and edit rows inline before saving to Firestore. |
 | **Milestone Generation (UC2)** | Uses OpenAI GPT-4o-mini to transform assessment + rubric/spec context into milestones with descriptions, target dates, and effort estimates. |
-| **Planner (UC3 / UC6)** | Builds a 7-day rolling study calendar, respects busy blocks and preferences, and offers Catch-up Reschedule with change diffs. |
+| **Planner (UC3 / UC6)** | Builds a 7-day rolling study calendar, respects busy blocks and preferences, offers Catch-up Reschedule with change diffs, and surfaces the LLM-authored guidance inside each study session. |
 | **Progress Dashboard (UC4 / UC5)** | Summarises progress, upcoming reminders, and completion KPIs; nudges students when a new plan is required. |
 
 ### Architecture at a Glance
@@ -95,13 +95,17 @@ All are fully integrated and verified via manual QA.
 
 ---
 
-## 6. LLM Agent Details
+## 6. LLM Agent Details & Impact
 
 - **Endpoint**: `/api/generate-milestones`
-- **Inputs**: Assessment metadata + concatenated rubric/spec text (20k char cap)
-- **Outputs**: Title, target date, hours estimate, rich description per milestone
+- **Inputs**: Assessment metadata + concatenated rubric/spec text (20k character cap)
+- **Outputs**: Title, target date, hours estimate, and rich milestone description
 - **Validation**: Schema guards before Firestore writes; trimming & dedupe to prevent runaway output
-- **Usage**: Planner session notes, milestone summaries, risk messaging all leverage the generated descriptions
+- **Downstream usage**:
+  - Milestone cards display the LLM-produced titles/descriptions.
+  - Planner sessions inherit those descriptions, so clicking a task shows AI-authored guidance on what to do.
+  - Catch-up warnings and risk badges reference the same milestone context to explain why work is at risk.
+- **Iterations**: Prompt tuning across sprints differentiated rubric vs. spec text, improved word limits, and accounted for user feedback from testing PDFs. The result is a measurable improvement in the clarity of the student’s study plan.
 
 ---
 
@@ -123,9 +127,9 @@ Artefacts available in our Jira board:
 | Area | Key Checks |
 | --- | --- |
 | Schedule Ingestion | CSV upload + manual edits, PDF attachments, ICS import, unlock/edit/save cycle |
-| Milestones | Generate per assessment, ensure banner & redirect only after all generated, edit saved entries |
-| Planner | Generate plan, verify busy-time conflict handling, Apply to Calendar with success message, column layout |
-| Catch-up | Overdue sessions produce change list + CTA; no-overdue path yields “up to date”; over-capacity shows warnings |
+| Milestones | Generate per assessment (observe LLM output in descriptions), ensure banner & redirect only after all generated, edit saved entries |
+| Planner | Generate plan, verify busy-time conflict handling, Apply to Calendar with success message, column layout, session drawers show LLM-authored guidance |
+| Catch-up | Overdue sessions produce change list + CTA referencing milestone context; no-overdue path yields “up to date”; over-capacity shows warnings |
 | Progress/Home | Notifications, metrics, first-time prompt to Schedule Ingestion |
 | Build | `npm run build` to confirm production bundle |
 
@@ -156,5 +160,3 @@ Record pass/fail notes (screenshots encouraged) alongside Jira QA tickets.
 - Product & ML design: Bianca Douroudis, Simon Bolomope, team
 - Scrum facilitation: H. Tran (Jira cadences, retros)
 - LLM prompt iteration: Sprint 2 pilot with live rubric PDFs
-
-Happy planning! 🎯
