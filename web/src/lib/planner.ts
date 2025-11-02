@@ -638,23 +638,12 @@ const scheduleSubtasks = (
 
     if (!chosen && fallback?.day) {
       warnings.push({
-        type: "capacity",
-        message: `"${sub.subtaskTitle}" cannot fit before its due date (${sub.dueDate}).`,
+        type: "deadline",
+        message: `"${sub.subtaskTitle}" overflowed the due date and was placed at the next available slot.`,
         detail:
-          "Increase your daily focus hours, expand the working window, or allow weekends to create enough space.",
+          "Increase your daily focus hours, expand the working window, or allow weekends to keep sessions before the deadline.",
       });
-      const blockedBy =
-        sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
-      unplaced.push(
-        createPlaceholderSession(
-          sub,
-          sub.durationHours,
-          version,
-          blockedBy,
-          options?.preserveIds
-        )
-      );
-      return;
+      chosen = fallback.day;
     }
 
     const targetDay = chosen || null;

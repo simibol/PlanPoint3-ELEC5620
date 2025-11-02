@@ -137,6 +137,17 @@ const shortDate = (isoDate: string) => {
   });
 };
 
+const formatTime12 = (time: string) => {
+  if (!time) return "";
+  const [hStr, mStr] = time.split(":");
+  const hours = Number(hStr);
+  const minutes = Number(mStr ?? "0");
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return time;
+  const suffix = hours >= 12 ? "pm" : "am";
+  const displayHour = hours % 12 === 0 ? 12 : hours % 12;
+  return `${displayHour}:${minutes.toString().padStart(2, "0")} ${suffix}`;
+};
+
 // --- week/date helpers for a fixed Mon→Sun 7-column calendar ---
 function startOfDay(d: Date) {
   const x = new Date(d);
@@ -303,6 +314,11 @@ export default function Planner() {
   const timeLabels = useMemo(
     () => generateTimeLabels(preferences.startHour, preferences.endHour),
     [preferences.startHour, preferences.endHour]
+  );
+
+  const columnHeight = useMemo(
+    () => Math.max(timeLabels.length * 48, 440),
+    [timeLabels.length]
   );
 
 
@@ -786,6 +802,43 @@ export default function Planner() {
     }
   }, [plan, preferences, busyBlocks]);
 
+  const handleUpdateSessionNotes = useCallback(
+    async (sessionId: string, nextNotes: string) => {
+      const timestamp = new Date().toISOString();
+      setPlan((prev) => {
+        if (!prev) return prev;
+        const update = (session: PlannedSession) =>
+          session.id === sessionId
+            ? { ...session, notes: nextNotes, updatedAt: timestamp }
+            : session;
+        return {
+          ...prev,
+          sessions: prev.sessions.map(update),
+          days: prev.days.map((day) => ({
+            ...day,
+            sessions: day.sessions.map(update),
+          })),
+          unplaced: prev.unplaced.map(update),
+        };
+      });
+      setSelectedSession((prev) =>
+        prev && prev.id === sessionId
+          ? { ...prev, notes: nextNotes, updatedAt: timestamp }
+          : prev
+      );
+      if (!uid) return;
+      try {
+        await updateDoc(doc(db, "users", uid, "planSessions", sessionId), {
+          notes: nextNotes,
+          updatedAt: timestamp,
+        });
+      } catch {
+        // ignore — plan may not be applied yet
+      }
+    },
+    [uid]
+  );
+
   // Toggle a session's completion (persist to Firestore if applied)
   const toggleDone = useCallback(
     async (sessionId: string, next: boolean) => {
@@ -902,11 +955,8 @@ export default function Planner() {
           </div>
           <div>
             <h1 style={{ margin: 0, letterSpacing: "-0.02em" }}>
-              Auto Planner
+              My PlanPoint Calendar
             </h1>
-            <div style={{ opacity: 0.9 }}>
-              Preferences on the left • Calendar on the right
-            </div>
           </div>
         </div>
 
@@ -921,13 +971,15 @@ export default function Planner() {
           <MetricTile
             label="Milestones ready"
             value={milestones.length.toString()}
-            helper="Generated via UC2"
+            helper="Saved from Ingest"
           />
           <MetricTile
             label="Active plan sessions"
             value={activePlanCount.toString()}
             helper={
-              activeVersion ? `Version ${activeVersion}` : "No plan applied"
+              activePlanCount
+                ? "Synced to calendar"
+                : "No plan applied yet"
             }
           />
           <MetricTile
@@ -1102,7 +1154,7 @@ export default function Planner() {
               fontSize: "0.8rem",
             }}
           >
-            Opens the Progress tracker preview to reallocate overdue sessions with minimal changes.
+            Pull overdue sessions into the next available study windows without leaving this page.
           </p>
 
           {error && (
@@ -1333,14 +1385,14 @@ export default function Planner() {
             }}
           >
             <div>
-              <h2 style={{ margin: 0, fontSize: "1.1rem", color: "#0f172a" }}>
-                Calendar
-              </h2>
-              <div style={{ color: "#64748b", fontSize: "0.9rem" }}>
-                {plan
-                  ? `Version ${plan.version} • ${plan.sessions.length} sessions`
-                  : "No preview yet"}
-              </div>
+            <h2 style={{ margin: 0, fontSize: "1.1rem", color: "#0f172a" }}>
+              Calendar Preview
+            </h2>
+            <div style={{ color: "#64748b", fontSize: "0.9rem" }}>
+              {plan
+                ? `${plan.sessions.length} session${plan.sessions.length === 1 ? "" : "s"} in this preview`
+                : "No preview yet"}
+            </div>
               <div style={{ color: "#334155", fontWeight: 600, marginTop: 6 }}>
                 {rangeTitle}
               </div>
@@ -1388,7 +1440,7 @@ export default function Planner() {
                     minWidth: "calc(220px * 7 + 140px)",
                   }}
                 >
-                  <TimeColumn labels={timeLabels} />
+                  <TimeColumn labels={timeLabels} height={columnHeight} />
                   {weekDays.map((day) => (
                   <DayColumn
                     key={day.date}
@@ -1398,6 +1450,7 @@ export default function Planner() {
                     onSelectSession={(session) => setSelectedSession(session)}
                     subjectLookup={subjectByAssessment}
                     busyBlocks={busyBlocksByDay.get(day.date) ?? []}
+                    columnHeight={columnHeight}
                   />
                 ))}
                 </div>
@@ -1407,6 +1460,7 @@ export default function Planner() {
                 <SessionDetail
                   session={selectedSession}
                   onClose={() => setSelectedSession(null)}
+                  onSaveNotes={handleUpdateSessionNotes}
                 />
               )}
 
@@ -1521,6 +1575,7 @@ function DayColumn({
   onSelectSession,
   subjectLookup,
   busyBlocks,
+  columnHeight,
 }: {
   day: PlanResult["days"][number];
   onToggleDone: (id: string, next: boolean) => void;
@@ -1528,6 +1583,7 @@ function DayColumn({
   onSelectSession: (session: PlannedSession) => void;
   subjectLookup: Map<string, string>;
   busyBlocks: BusyBlock[];
+  columnHeight: number;
 }) {
   return (
     <div
@@ -1536,7 +1592,7 @@ function DayColumn({
         borderRadius: 12,
         padding: "1rem",
         background: "#ffffff",
-        minHeight: 440,
+        minHeight: columnHeight,
         display: "flex",
         flexDirection: "column",
         gap: "0.5rem",
@@ -1705,7 +1761,7 @@ function SessionCard({
           {header}
         </div>
         <div style={{ fontSize: "0.8rem", color: "#334155" }}>
-          {session.startTime}–{session.endTime}
+          {formatTime12(session.startTime)}–{formatTime12(session.endTime)}
         </div>
       </div>
       {subjectLine && (
@@ -1771,9 +1827,9 @@ function MetricTile({
     >
       <div style={{ fontSize: "0.82rem", opacity: 0.9 }}>{label}</div>
       <div style={{ fontSize: "1.3rem", fontWeight: 800 }}>{value}</div>
-      {helper && (
+      {helper ? (
         <div style={{ fontSize: "0.78rem", opacity: 0.85 }}>{helper}</div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -1948,32 +2004,37 @@ const formatTimeRange = (startIso: string, endIso: string) => {
   ) {
     return `${startIso}–${endIso}`;
   }
-  const makeLabel = (d: Date) => {
-    const hours = d.getHours();
-    const minutes = d.getMinutes();
-    const period = hours >= 12 ? "pm" : "am";
-    const displayHour = hours % 12 === 0 ? 12 : hours % 12;
-    return `${displayHour}:${minutes.toString().padStart(2, "0")}${period}`;
-  };
+  const makeLabel = (d: Date) =>
+    formatTime12(`${d.getHours().toString().padStart(2, "0")}:${d
+      .getMinutes()
+      .toString()
+      .padStart(2, "0")}`);
   return `${makeLabel(start)}–${makeLabel(end)}`;
 };
 
-function TimeColumn({ labels }: { labels: string[] }) {
+function TimeColumn({ labels, height }: { labels: string[]; height: number }) {
   return (
     <div
       style={{
-        minHeight: 440,
+        minHeight: height,
         padding: "1rem 0.5rem",
-        display: "flex",
-        flexDirection: "column",
-        justifyContent: "space-between",
+        display: "grid",
+        gridTemplateRows: `repeat(${labels.length}, 1fr)`,
         color: "#64748b",
         fontSize: "0.85rem",
         alignItems: "flex-end",
       }}
     >
       {labels.map((label) => (
-        <div key={label} style={{ padding: "0.35rem 0.5rem" }}>
+        <div
+          key={label}
+          style={{
+            padding: "0.2rem 0.5rem",
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "flex-end",
+          }}
+        >
           {label}
         </div>
       ))}
@@ -1984,11 +2045,34 @@ function TimeColumn({ labels }: { labels: string[] }) {
 function SessionDetail({
   session,
   onClose,
+  onSaveNotes,
 }: {
   session: PlannedSession;
   onClose: () => void;
+  onSaveNotes: (sessionId: string, notes: string) => Promise<void> | void;
 }) {
   const color = riskColors(session.riskLevel);
+  const [notesValue, setNotesValue] = useState(session.notes ?? "");
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setNotesValue(session.notes ?? "");
+    setDirty(false);
+    setSaving(false);
+  }, [session]);
+
+  const handleSave = async () => {
+    if (!dirty) return;
+    try {
+      setSaving(true);
+      await onSaveNotes(session.id, notesValue.trim());
+      setDirty(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div
       style={{
@@ -2024,7 +2108,8 @@ function SessionDetail({
         {session.subtaskTitle}
       </h3>
       <div style={{ color: "#475569", marginBottom: "0.6rem" }}>
-        {longDate(session.date)} • {session.startTime} – {session.endTime}
+        {longDate(session.date)} • {formatTime12(session.startTime)} –{" "}
+        {formatTime12(session.endTime)}
       </div>
       <div
         style={{
@@ -2047,36 +2132,74 @@ function SessionDetail({
         <br />
         <strong>Duration:</strong> {session.durationHours.toFixed(1)} hours
       </div>
-      <div
-        style={{
-          marginTop: "0.8rem",
-          padding: "0.75rem 0.9rem",
-          background: "#f8fafc",
-          borderRadius: 12,
-          color: "#1e293b",
-          fontSize: "0.9rem",
-        }}
-      >
-        {session.notes
-          ? session.notes
-          : "No additional guidance provided for this session."}
+      <div style={{ marginTop: "0.8rem" }}>
+        <label
+          style={{
+            display: "block",
+            marginBottom: "0.4rem",
+            color: "#334155",
+            fontSize: "0.85rem",
+            fontWeight: 600,
+          }}
+        >
+          Notes / guidance
+        </label>
+        <textarea
+          value={notesValue}
+          onChange={(e) => {
+            setNotesValue(e.target.value);
+            setDirty(true);
+          }}
+          rows={5}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            fontSize: "0.9rem",
+            padding: "0.65rem",
+            borderRadius: 10,
+            border: "1px solid #cbd5e1",
+            background: "#f8fafc",
+            color: "#0f172a",
+          }}
+          placeholder="Add personalised instructions or reminders for this session."
+        />
       </div>
-      <button
-        onClick={() => onClose()}
-        style={{
-          marginTop: "1rem",
-          width: "100%",
-          padding: "0.6rem",
-          borderRadius: 10,
-          border: "none",
-          background: "linear-gradient(135deg,#38bdf8,#6366f1)",
-          color: "white",
-          fontWeight: 600,
-          cursor: "pointer",
-        }}
-      >
-        Close
-      </button>
+      <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.85rem" }}>
+        <button
+          onClick={handleSave}
+          disabled={!dirty || saving}
+          style={{
+            flex: 1,
+            padding: "0.55rem",
+            borderRadius: 10,
+            border: "none",
+            background:
+              !dirty || saving
+                ? "#e2e8f0"
+                : "linear-gradient(135deg,#22d3ee,#6366f1)",
+            color: !dirty || saving ? "#64748b" : "white",
+            fontWeight: 600,
+            cursor: !dirty || saving ? "not-allowed" : "pointer",
+          }}
+        >
+          {saving ? "Saving…" : "Save notes"}
+        </button>
+        <button
+          onClick={() => onClose()}
+          style={{
+            flex: 1,
+            padding: "0.55rem",
+            borderRadius: 10,
+            border: "1px solid #cbd5e1",
+            background: "white",
+            color: "#475569",
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          Close
+        </button>
+      </div>
     </div>
   );
 }
