@@ -73,6 +73,20 @@ const startOfDay = (d: Date) => {
   return out;
 };
 
+const parseIsoDate = (value?: string | null) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return startOfDay(parsed);
+};
+
+const toLocalDateKey = (d: Date) => {
+  const year = d.getFullYear();
+  const month = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
 const startOfWeek = (d: Date) => {
   const date = startOfDay(d);
   const day = date.getDay();
@@ -92,9 +106,7 @@ const isWeekend = (d: Date) => {
   return day === 0 || day === 6;
 };
 
-const formatDateKey = (d: Date) => {
-  return d.toISOString().slice(0, 10);
-};
+const formatDateKey = (d: Date) => toLocalDateKey(d);
 
 const parseDateKey = (key: string) => {
   return startOfDay(new Date(`${key}T00:00:00`));
@@ -267,6 +279,172 @@ const divideHours = (
   return parts;
 };
 
+const MICRO_MIN_HOURS = 0.25;
+
+const createPlaceholderSession = (
+  sub: SubtaskInput,
+  remainingHours: number,
+  version: number,
+  blockedBy: string | undefined,
+  preserveIds?: boolean
+): PlannedSession => {
+  const placeholderId = preserveIds
+    ? `${sub.id}-unplaced-${Math.random().toString(36).slice(2, 6)}`
+    : makeId(`${sub.id}-unplaced`);
+  const nowIso = new Date().toISOString();
+  const session: PlannedSession = {
+    id: placeholderId,
+    assessmentTitle: sub.assessmentTitle,
+    assessmentDueDate: sub.assessmentDueDate,
+    milestoneTitle: sub.milestoneTitle,
+    subtaskTitle: sub.subtaskTitle,
+    date: sub.dueDate,
+    startTime: "09:00",
+    endTime: "10:00",
+    durationHours: Number(remainingHours.toFixed(2)),
+    status: "planned",
+    notes: sub.notes,
+    riskLevel: "at-risk",
+    version,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+  if (blockedBy) {
+    session.blockedBy = blockedBy;
+  }
+  return session;
+};
+
+const allocateDeferredSubtasks = (
+  deferred: {
+    sub: SubtaskInput;
+    blockedBy?: string;
+    reason: "capacity" | "conflict";
+  }[],
+  days: MutableDay[],
+  prefs: PlannerPreferences,
+  version: number,
+  sessions: PlannedSession[],
+  warnings: PlanWarning[],
+  lastSessionByMilestone: Map<string, string>,
+  options?: ScheduleOptions
+): PlannedSession[] => {
+  if (!deferred.length) return [];
+  const leftovers: PlannedSession[] = [];
+  const nowIso = new Date().toISOString();
+  const minChunk = Math.min(prefs.minSessionMinutes / 60, MICRO_MIN_HOURS);
+  const maxChunk = prefs.maxSessionMinutes / 60;
+
+  deferred.forEach(({ sub, blockedBy }) => {
+    let remaining = Number(sub.durationHours.toFixed(2));
+    const dueTs = parseDateKey(sub.dueDate).getTime();
+    let splitIndex = 0;
+
+    for (const day of days) {
+      const dayDate = parseDateKey(day.date).getTime();
+      if (dayDate > dueTs + EPSILON) break;
+      let slotIndex = 0;
+      while (
+        slotIndex < day.availableSlots.length &&
+        remaining > minChunk - EPSILON
+      ) {
+        const slot = day.availableSlots[slotIndex];
+        const slotLength = slot.end - slot.start;
+        const dayRemainingCap = Math.max(0, day.capacity - day.workedHours);
+        const usable = Math.min(
+          slotLength,
+          dayRemainingCap,
+          maxChunk,
+          remaining
+        );
+        if (usable < minChunk - EPSILON) {
+          slotIndex += 1;
+          continue;
+        }
+        const duration = Number(usable.toFixed(2));
+        const start = slot.start;
+        const end = start + duration;
+        const sessionId = options?.preserveIds
+          ? `${sub.id}-split-${splitIndex}`
+          : makeId(`${sub.id}-split-${splitIndex}`);
+        const sessionTitle =
+          splitIndex === 0
+            ? `${sub.subtaskTitle} (split)`
+            : `${sub.subtaskTitle} (split ${splitIndex + 1})`;
+        const session: PlannedSession = {
+          id: sessionId,
+          assessmentTitle: sub.assessmentTitle,
+          assessmentDueDate: sub.assessmentDueDate,
+          milestoneTitle: sub.milestoneTitle,
+          subtaskTitle: sessionTitle,
+          date: day.date,
+          startTime: toTimeString(start),
+          endTime: toTimeString(end),
+          durationHours: duration,
+          status: "planned",
+          notes: sub.notes,
+          riskLevel: "on-track",
+          version,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        const prior = lastSessionByMilestone.get(sub.milestoneTitle);
+        if (blockedBy && splitIndex === 0) {
+          session.blockedBy = blockedBy;
+        } else if (prior) {
+          session.blockedBy = prior;
+        }
+
+        day.sessions.push(session);
+        day.sessions.sort((a, b) => a.startTime.localeCompare(b.startTime));
+        day.workedHours = Number((day.workedHours + duration).toFixed(2));
+        day.totalHours = day.workedHours;
+        day.assessmentLoad[sub.assessmentTitle] =
+          (day.assessmentLoad[sub.assessmentTitle] || 0) + 1;
+
+        if (end >= slot.end - EPSILON) {
+          day.availableSlots.splice(slotIndex, 1);
+        } else {
+          day.availableSlots[slotIndex] = {
+            start: Number(end.toFixed(4)),
+            end: slot.end,
+          };
+          slotIndex += 1;
+        }
+
+        sessions.push(session);
+        lastSessionByMilestone.set(sub.milestoneTitle, sessionId);
+        blockedBy = sessionId;
+        remaining = Number((remaining - duration).toFixed(2));
+        splitIndex += 1;
+      }
+      if (remaining <= minChunk - EPSILON) break;
+    }
+
+    if (remaining > minChunk - EPSILON) {
+      leftovers.push(
+        createPlaceholderSession(
+          sub,
+          remaining,
+          version,
+          blockedBy,
+          options?.preserveIds
+        )
+      );
+      warnings.push({
+        type: "capacity",
+        message: `Only partially scheduled "${sub.subtaskTitle}". ${remaining.toFixed(
+          1
+        )}h still needs time before ${sub.dueDate}.`,
+        detail:
+          "Expand availability, allow weekends, or reduce session length to place the remaining work.",
+      });
+    }
+  });
+
+  return leftovers;
+};
+
 const createSubtasks = (
   milestone: Milestone,
   assessment: Assessment | undefined,
@@ -274,7 +452,19 @@ const createSubtasks = (
 ): SubtaskInput[] => {
   const total = Math.max(milestone.estimateHrs ?? 2, 1);
   const segments = divideHours(total, prefs);
-  const dueDate = milestone.targetDate || assessment?.dueDate || new Date().toISOString();
+  const milestoneDue = parseIsoDate(milestone.targetDate);
+  const assessmentDue = parseIsoDate(assessment?.dueDate);
+  let dueCandidate: Date | null = null;
+  if (milestoneDue && assessmentDue) {
+    dueCandidate =
+      milestoneDue.getTime() <= assessmentDue.getTime()
+        ? milestoneDue
+        : assessmentDue;
+  } else {
+    dueCandidate = milestoneDue ?? assessmentDue ?? startOfDay(new Date());
+  }
+  const dueDate = toLocalDateKey(dueCandidate);
+  const assessmentDueIso = assessmentDue ? toLocalDateKey(assessmentDue) : dueDate;
   const importance =
     (assessment?.weight ?? 10) +
     Math.max(0, 50 - Math.min(50, segments.length * 5));
@@ -312,7 +502,7 @@ const createSubtasks = (
     return {
       id: `${milestone.assessmentTitle}-${milestone.title}-${index}`,
       assessmentTitle: milestone.assessmentTitle,
-      assessmentDueDate: milestone.assessmentDueDate || dueDate,
+      assessmentDueDate: assessmentDueIso,
       milestoneTitle: milestone.title,
       subtaskTitle,
       durationHours: Number(hours.toFixed(2)),
@@ -353,14 +543,14 @@ const scheduleSubtasks = (
 
   const sortedSubtasks = [...subtasks].sort((a, b) => {
     const dueDiff =
-      new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime();
+      parseDateKey(a.dueDate).getTime() - parseDateKey(b.dueDate).getTime();
     if (dueDiff !== 0) return dueDiff;
     if (b.weightScore !== a.weightScore) return b.weightScore - a.weightScore;
     return a.order - b.order;
   });
 
   let maxDue = sortedSubtasks.reduce((latest, sub) => {
-    const due = new Date(sub.dueDate).getTime();
+    const due = parseDateKey(sub.dueDate).getTime();
     return due > latest ? due : latest;
   }, start.getTime());
   if (maxDue < start.getTime()) {
@@ -401,6 +591,11 @@ const scheduleSubtasks = (
   const unplaced: PlannedSession[] = [];
   const sessions: PlannedSession[] = [];
   const lastSessionByMilestone = new Map<string, string>();
+  const deferred: {
+    sub: SubtaskInput;
+    blockedBy?: string;
+    reason: "capacity" | "conflict";
+  }[] = [];
 
   sortedSubtasks.forEach((sub) => {
     if (sub.durationHours <= 0) return;
@@ -441,7 +636,28 @@ const scheduleSubtasks = (
       }
     }
 
-    const targetDay = chosen || fallback?.day || null;
+    if (!chosen && fallback?.day) {
+      warnings.push({
+        type: "capacity",
+        message: `"${sub.subtaskTitle}" cannot fit before its due date (${sub.dueDate}).`,
+        detail:
+          "Increase your daily focus hours, expand the working window, or allow weekends to create enough space.",
+      });
+      const blockedBy =
+        sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
+      unplaced.push(
+        createPlaceholderSession(
+          sub,
+          sub.durationHours,
+          version,
+          blockedBy,
+          options?.preserveIds
+        )
+      );
+      return;
+    }
+
+    const targetDay = chosen || null;
     let riskLevel: "on-track" | "warning" | "at-risk";
     if (!targetDay) {
       riskLevel = "at-risk";
@@ -462,27 +678,9 @@ const scheduleSubtasks = (
         detail:
           "Increase daily capacity, allow weekends, or reduce session duration.",
       });
-      const placeholderId = options?.preserveIds ? sub.id : makeId(sub.id);
-      const blockedBy = sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
-      const placeholder: PlannedSession = {
-        id: placeholderId,
-        assessmentTitle: sub.assessmentTitle,
-        assessmentDueDate: sub.assessmentDueDate,
-        milestoneTitle: sub.milestoneTitle,
-        subtaskTitle: sub.subtaskTitle,
-        date: formatDateKey(new Date(sub.dueDate)),
-        startTime: "09:00",
-        endTime: "10:00",
-        durationHours: sub.durationHours,
-        status: "planned",
-        notes: sub.notes,
-        riskLevel: "at-risk",
-        version,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        ...(blockedBy ? { blockedBy } : {}),
-      };
-      unplaced.push(placeholder);
+      const blockedBy =
+        sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
+      deferred.push({ sub, blockedBy, reason: "capacity" });
       return;
     }
 
@@ -498,27 +696,9 @@ const scheduleSubtasks = (
         detail:
           "Adjust busy calendar entries or expand availability to free up space.",
       });
-      const placeholderId = options?.preserveIds ? sub.id : makeId(sub.id);
       const blockedBy =
         sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
-      unplaced.push({
-        id: placeholderId,
-        assessmentTitle: sub.assessmentTitle,
-        assessmentDueDate: sub.assessmentDueDate,
-        milestoneTitle: sub.milestoneTitle,
-        subtaskTitle: sub.subtaskTitle,
-        date: formatDateKey(new Date(sub.dueDate)),
-        startTime: "09:00",
-        endTime: "10:00",
-        durationHours: sub.durationHours,
-        status: "planned",
-        notes: sub.notes,
-        riskLevel: "at-risk",
-        version,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        ...(blockedBy ? { blockedBy } : {}),
-      });
+      deferred.push({ sub, blockedBy, reason: "conflict" });
       return;
     }
 
@@ -588,6 +768,20 @@ const scheduleSubtasks = (
     sessions.push(session);
     lastSessionByMilestone.set(sub.milestoneTitle, sessionId);
   });
+
+  if (deferred.length) {
+    const micro = allocateDeferredSubtasks(
+      deferred,
+      days,
+      prefs,
+      version,
+      sessions,
+      warnings,
+      lastSessionByMilestone,
+      options
+    );
+    unplaced.push(...micro);
+  }
 
   const daySummaries: DaySummary[] = days.map((day) => ({
     date: day.date,

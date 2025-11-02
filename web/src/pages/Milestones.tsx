@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import { auth, db } from "../firebase";
-import { collection, getDocs, doc, setDoc } from "firebase/firestore";
+import {
+  collection,
+  getDocs,
+  doc,
+  setDoc,
+  query,
+  where,
+  writeBatch,
+} from "firebase/firestore";
 import type { Assessment, Milestone } from "../types";
+import { cascadeDeleteMilestone } from "../lib/dataCleanup";
 
 type MilestonesResponse = {
   milestones: Milestone[];
@@ -94,6 +103,7 @@ export default function Milestones() {
         ...m,
         assessmentTitle: m.assessmentTitle ?? a.title,
         assessmentDueDate: m.assessmentDueDate ?? a.dueDate,
+        description: m.description,
       }));
       setDraft(sanitized);
     } catch (e: any) {
@@ -107,18 +117,40 @@ export default function Milestones() {
     if (!uid || !draft?.length) return;
     const col = collection(db, "users", uid, "milestones");
     const selectedAssessment = selected;
-    await Promise.all(
-      draft.map((m) =>
-        setDoc(
-          doc(col),
-          {
-            ...m,
-            assessmentTitle: selectedAssessment?.title ?? m.assessmentTitle,
-            assessmentDueDate: selectedAssessment?.dueDate ?? m.assessmentDueDate,
-          }
-        )
-      )
+    const targetTitle = selectedAssessment?.title ?? draft[0].assessmentTitle;
+    const existingSnap = await getDocs(
+      query(col, where("assessmentTitle", "==", targetTitle))
     );
+    const existingMilestones = existingSnap.docs.map((docSnap) => ({
+      id: docSnap.id,
+      ...(docSnap.data() as Milestone),
+    }));
+
+    const batch = writeBatch(db);
+    existingSnap.forEach((docSnap) => batch.delete(docSnap.ref));
+
+    draft.forEach((m) => {
+      const ref = doc(col);
+      batch.set(ref, {
+        ...m,
+        assessmentTitle: selectedAssessment?.title ?? m.assessmentTitle,
+        assessmentDueDate:
+          selectedAssessment?.dueDate ?? m.assessmentDueDate,
+      });
+    });
+
+    await batch.commit();
+
+    if (existingMilestones.length) {
+      await Promise.all(
+        existingMilestones.map((m) =>
+          cascadeDeleteMilestone(uid, {
+            assessmentTitle: m.assessmentTitle,
+            title: m.title,
+          })
+        )
+      );
+    }
     if (selectedAssessment) {
       const key = makeAssessmentKey(selectedAssessment.title, selectedAssessment.dueDate);
       setGeneratedFor((prev) => {

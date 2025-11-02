@@ -15,7 +15,7 @@ import type { BusyBlock } from "../types";
 import { parseIcsBusy } from "../lib/ingest/ics";
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist/build/pdf";
 import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?worker";
-import { cascadeDeleteAssessments } from "../lib/dataCleanup";
+import { cascadeDeleteAssessments, type AssessmentRef } from "../lib/dataCleanup";
 
 import type { Assessment } from "../types";
 
@@ -274,6 +274,15 @@ export default function Ingest() {
     const batch = writeBatch(db);
     const keepIds = new Set<string>();
     const nextRows: EditableAssessment[] = [];
+    const existingById = new Map<
+      string,
+      EditableAssessment & { id: string }
+    >(
+      savedAssessments
+        .filter((a): a is EditableAssessment & { id: string } => Boolean(a.id))
+        .map((a) => [a.id!, a])
+    );
+    const dueDateChanges: AssessmentRef[] = [];
 
     try {
       valid.forEach((a) => {
@@ -288,6 +297,18 @@ export default function Ingest() {
         batch.set(docRef, payload);
         keepIds.add(docRef.id);
         nextRows.push({ ...a, id: docRef.id });
+
+        if (id && existingById.has(id)) {
+          const prior = existingById.get(id)!;
+          if (
+            prior.dueDate &&
+            rest.dueDate &&
+            new Date(prior.dueDate).getTime() !==
+              new Date(rest.dueDate).getTime()
+          ) {
+            dueDateChanges.push({ title: prior.title, dueDate: prior.dueDate });
+          }
+        }
       });
 
       const removalCandidates = Array.from(new Set(removedIds)).filter(
@@ -333,6 +354,28 @@ export default function Ingest() {
       setLastCsvName(null);
 
       alert(`Saved ${valid.length} assessment(s). Go to Milestones next.`);
+
+      if (dueDateChanges.length) {
+        const uniqueRefresh = Array.from(
+          new Map(
+            dueDateChanges.map((item) => [item.title, item] as const)
+          ).values()
+        );
+        try {
+          await cascadeDeleteAssessments(
+            uid,
+            uniqueRefresh.map(({ title, dueDate }) => ({
+              title,
+              dueDate,
+            }))
+          );
+        } catch (cascadeError) {
+          console.error(
+            "[Ingest] failed to refresh milestones for due-date changes",
+            cascadeError
+          );
+        }
+      }
     } catch (err: any) {
       console.error("[Ingest] failed to save assessments", err);
       alert(err?.message || "Failed to save assessments.");
