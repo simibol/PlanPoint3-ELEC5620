@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   collection,
   doc,
@@ -8,6 +9,7 @@ import {
   setDoc,
   writeBatch,
   updateDoc,
+  deleteDoc,
 } from "firebase/firestore";
 
 import { onAuthStateChanged } from "firebase/auth";
@@ -17,13 +19,16 @@ import type {
   Milestone,
   PlannerPreferences,
   PlanResult,
-  PlanSession,
+  BusyBlock,
+  DaySummary,
 } from "../types";
 import {
   DEFAULT_PREFERENCES,
   planMilestones,
+  rescheduleSessions,
   withDefaults,
 } from "../lib/planner";
+import { cascadeDeleteMilestone } from "../lib/dataCleanup";
 
 import type { PlannedSession, SessionStatus, RiskLevel } from "../types";
 
@@ -57,8 +62,23 @@ function ensureId(s: any): string {
 // Convert raw PlanSession/engine output → PlannedSession (no 'done' property)
 function toPlannedSession(s: any, version: number): PlannedSession {
   const now = new Date().toISOString();
-  return {
+  const notes =
+    typeof s?.notes === "string"
+      ? s.notes
+      : s?.notes != null
+      ? String(s.notes)
+      : "";
+  const base: Record<string, any> = {
     ...s,
+    notes,
+  };
+  Object.keys(base).forEach((key) => {
+    if (base[key] === undefined) {
+      delete base[key];
+    }
+  });
+  return {
+    ...base,
     id: ensureId(s),
     riskLevel: normalizeRiskLevel(s.riskLevel) as RiskLevel, // cast to domain type
     status: (s.status as SessionStatus) ?? ("planned" as SessionStatus),
@@ -75,23 +95,60 @@ const isDone = (status?: SessionStatus) =>
 const DONE_STATUS = "completed" as SessionStatus;
 const TODO_STATUS = "planned" as SessionStatus; // or "todo" if your union has it
 
+const PREF_WINDOW_ERROR =
+  "Daily focus hours exceed the available time window. Adjust start/end or reduce focus hours.";
+
+const getPreferenceWindowError = (prefs: PlannerPreferences) => {
+  const available = prefs.endHour - prefs.startHour;
+  return available < prefs.dailyCapHours ? PREF_WINDOW_ERROR : null;
+};
+
+const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
+
 // --- date formatting helpers (AU) ---
-const longDate = (isoDate: string) =>
-  new Date(`${isoDate}T00:00:00`).toLocaleDateString("en-AU", {
+function parseFlexibleDate(input?: string | null): Date | null {
+  if (!input) return null;
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  const hasTime = trimmed.includes("T");
+  const candidate = hasTime ? new Date(trimmed) : new Date(`${trimmed}T00:00:00`);
+  if (Number.isNaN(candidate.getTime())) return null;
+  return candidate;
+}
+
+const longDate = (isoDate: string) => {
+  const parsed = parseFlexibleDate(isoDate);
+  if (!parsed) return "Invalid date";
+  return parsed.toLocaleDateString("en-AU", {
     weekday: "short",
     year: "numeric",
     month: "short",
     day: "numeric",
     timeZone: "Australia/Sydney",
   });
+};
 
-const shortDate = (isoDate: string) =>
-  new Date(`${isoDate}T00:00:00`).toLocaleDateString("en-AU", {
+const shortDate = (isoDate: string) => {
+  const parsed = parseFlexibleDate(isoDate);
+  if (!parsed) return "Invalid date";
+  return parsed.toLocaleDateString("en-AU", {
     weekday: "short",
     month: "short",
     day: "numeric",
     timeZone: "Australia/Sydney",
   });
+};
+
+const formatTime12 = (time: string) => {
+  if (!time) return "";
+  const [hStr, mStr] = time.split(":");
+  const hours = Number(hStr);
+  const minutes = Number(mStr ?? "0");
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return time;
+  const suffix = hours >= 12 ? "pm" : "am";
+  const displayHour = hours % 12 === 0 ? 12 : hours % 12;
+  return `${displayHour}:${minutes.toString().padStart(2, "0")} ${suffix}`;
+};
 
 // --- week/date helpers for a fixed Mon→Sun 7-column calendar ---
 function startOfDay(d: Date) {
@@ -136,6 +193,80 @@ function formatRangeCaption(dates: Date[]): string {
 
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
+function summariseSessions(
+  sessions: PlannedSession[],
+  prefs: PlannerPreferences
+): DaySummary[] {
+  const byDate = new Map<string, PlannedSession[]>();
+  sessions.forEach((session) => {
+    if (!byDate.has(session.date)) byDate.set(session.date, []);
+    byDate.get(session.date)!.push(session);
+  });
+  return Array.from(byDate.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, list]) => {
+      const total = list.reduce((sum, s) => sum + s.durationHours, 0);
+      const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+      return {
+        date,
+        isWeekend: dayOfWeek === 0 || dayOfWeek === 6,
+        capacity: prefs.dailyCapHours,
+        totalHours: Number(total.toFixed(2)),
+        sessions: list
+          .slice()
+          .sort((a, b) =>
+            a.startTime.localeCompare(b.startTime) || a.id.localeCompare(b.id)
+          ),
+      };
+    });
+}
+
+const pad = (value: number) => value.toString().padStart(2, "0");
+
+const toDayKey = (value: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate()
+  )}`;
+};
+
+function mergeRescheduledPlan(
+  basePlan: PlanResult,
+  res: PlanResult,
+  prefs: PlannerPreferences
+): PlanResult {
+  const replacements = new Map(res.sessions.map((s) => [s.id, s]));
+  const mergedSessions = basePlan.sessions.map((session) => {
+    const updated = replacements.get(session.id);
+    if (!updated) return session;
+    return {
+      ...session,
+      ...updated,
+    };
+  });
+  // include any brand-new sessions (should be rare)
+  res.sessions.forEach((session) => {
+    if (!mergedSessions.find((s) => s.id === session.id)) {
+      mergedSessions.push(session);
+    }
+  });
+  const sortedSessions = mergedSessions
+    .slice()
+    .sort((a, b) =>
+      a.date.localeCompare(b.date) ||
+      a.startTime.localeCompare(b.startTime) ||
+      a.id.localeCompare(b.id)
+    );
+  return {
+    sessions: sortedSessions,
+    days: summariseSessions(sortedSessions, prefs),
+    warnings: res.warnings.length ? res.warnings : basePlan.warnings,
+    unplaced: res.unplaced.length ? res.unplaced : basePlan.unplaced,
+    version: basePlan.version ?? Date.now(),
+  };
+}
+
 // --- risk pill UI color ---
 function riskColors(risk: PlannedSession["riskLevel"]) {
   switch (risk) {
@@ -151,12 +282,14 @@ function riskColors(risk: PlannedSession["riskLevel"]) {
 }
 
 export default function Planner() {
+  const navigate = useNavigate();
   const [uid, setUid] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
   const [assessments, setAssessments] = useState<Assessment[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [busyBlocks, setBusyBlocks] = useState<BusyBlock[]>([]);
   const [preferences, setPreferences] =
     useState<PlannerPreferences>(DEFAULT_PREFERENCES);
   const [prefDirty, setPrefDirty] = useState(false);
@@ -166,9 +299,30 @@ export default function Planner() {
   const [activeVersion, setActiveVersion] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [prefError, setPrefError] = useState<string | null>(null);
+  const [catchupMessage, setCatchupMessage] = useState<string | null>(null);
 
   // week paging for calendar preview
   const [weekStartIndex, setWeekStartIndex] = useState(0);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [highlightedSessionId, setHighlightedSessionId] = useState<string | null>(null);
+  const [selectedSession, setSelectedSession] = useState<PlannedSession | null>(null);
+  const focusSessionId = searchParams.get("focus");
+  const emptyState = useMemo(
+    () => milestones.length === 0 && (!plan || plan.sessions.length === 0),
+    [milestones.length, plan]
+  );
+
+  const timeLabels = useMemo(
+    () => generateTimeLabels(preferences.startHour, preferences.endHour),
+    [preferences.startHour, preferences.endHour]
+  );
+
+  const columnHeight = useMemo(
+    () => Math.max(timeLabels.length * 48, 440),
+    [timeLabels.length]
+  );
+
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => setUid(u?.uid ?? null));
@@ -184,13 +338,21 @@ export default function Planner() {
     const milestonesCol = collection(db, "users", uid, "milestones");
     const planCol = collection(db, "users", uid, "planSessions");
     const settingsDoc = doc(db, "users", uid, "settings", "planner");
+    const busyCol = collection(db, "users", uid, "busy");
 
     // live listeners for assessments & milestones
     const unsubAssess = onSnapshot(assessmentsCol, (snap) => {
       setAssessments(snap.docs.map((d) => d.data() as Assessment));
     });
     const unsubMiles = onSnapshot(milestonesCol, (snap) => {
-      setMilestones(snap.docs.map((d) => d.data() as Milestone));
+      const list = snap.docs.map((d) => ({
+        id: d.id,
+        ...(d.data() as Milestone),
+      }));
+      setMilestones(list);
+    });
+    const unsubBusy = onSnapshot(busyCol, (snap) => {
+      setBusyBlocks(snap.docs.map((d) => d.data() as BusyBlock));
     });
 
     // one-shot reads for plan + prefs
@@ -204,13 +366,66 @@ export default function Planner() {
         const first = planSnap.docs[0]?.data() as
           | { version?: number }
           | undefined;
+        const prefs = prefsSnap.exists()
+          ? withDefaults(prefsSnap.data() as PlannerPreferences)
+          : DEFAULT_PREFERENCES;
+        setPreferences(prefs);
         setActiveVersion(first?.version ?? null);
 
-        setPreferences(
-          prefsSnap.exists()
-            ? withDefaults(prefsSnap.data() as PlannerPreferences)
-            : DEFAULT_PREFERENCES
-        );
+        const existingSessions: PlannedSession[] = planSnap.docs
+          .map((docSnap) => {
+            const data = docSnap.data() as PlannedSession;
+            return {
+              ...data,
+              id: docSnap.id,
+              status: (data.status as SessionStatus) ?? "planned",
+              notes: typeof data.notes === "string" ? data.notes : "",
+            };
+          })
+          .sort((a, b) => {
+            const dateDiff = a.date.localeCompare(b.date);
+            if (dateDiff !== 0) return dateDiff;
+            return a.startTime.localeCompare(b.startTime);
+          });
+
+        if (existingSessions.length) {
+          const byDate = new Map<string, PlannedSession[]>();
+          existingSessions.forEach((session) => {
+            if (!byDate.has(session.date)) {
+              byDate.set(session.date, []);
+            }
+            byDate.get(session.date)!.push(session);
+          });
+
+          const days: DaySummary[] = Array.from(byDate.entries())
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([date, sessions]) => {
+              const total = sessions.reduce(
+                (sum, s) => sum + s.durationHours,
+                0
+              );
+              const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+              return {
+                date,
+                isWeekend: dayOfWeek === 0 || dayOfWeek === 6,
+                capacity: prefs.dailyCapHours,
+                totalHours: Number(total.toFixed(2)),
+                sessions: sessions
+                  .slice()
+                  .sort((a, b) => a.startTime.localeCompare(b.startTime)),
+              };
+            });
+
+          setPlan({
+            sessions: existingSessions,
+            days,
+            warnings: [],
+            unplaced: [],
+            version: first?.version ?? Date.now(),
+          });
+        } else {
+          setPlan(null);
+        }
       } catch (e: any) {
         setError(e.message || "Failed to load planner data.");
       } finally {
@@ -221,6 +436,7 @@ export default function Planner() {
     return () => {
       unsubAssess();
       unsubMiles();
+      unsubBusy();
     };
   }, [uid]);
 
@@ -234,11 +450,129 @@ export default function Planner() {
     return map;
   }, [milestones]);
 
+  const subjectByAssessment = useMemo(() => {
+    const map = new Map<string, string>();
+    assessments.forEach((a) => {
+      if (!a?.title) return;
+      if (a.course) {
+        map.set(a.title, a.course);
+      }
+    });
+    return map;
+  }, [assessments]);
+
+  const unplacedMilestoneKeys = useMemo(() => {
+    if (!plan?.unplaced?.length) return new Set<string>();
+    return new Set(
+      plan.unplaced.map(
+        (session) => `${session.assessmentTitle}|${session.milestoneTitle}`
+      )
+    );
+  }, [plan]);
+  const unplacedCount = plan?.unplaced?.length ?? 0;
+  const busyBlocksByDay = useMemo(() => {
+    const map = new Map<string, BusyBlock[]>();
+    busyBlocks.forEach((block) => {
+      const key = toDayKey(block.start);
+      if (!key) return;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(block);
+    });
+    return map;
+  }, [busyBlocks]);
+
+  const lastPlanSignatureRef = useRef<string | null>(null);
+  const catchupSignatureRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!plan) return;
+    const signature = `${plan.version ?? "na"}|${plan.sessions.length}`;
+    if (lastPlanSignatureRef.current === signature) {
+      return;
+    }
+    lastPlanSignatureRef.current = signature;
     setSuccessMessage(null);
     setWeekStartIndex(0);
+    setSelectedSession(null);
   }, [plan]);
+
+  useEffect(() => {
+    if (!focusSessionId) return;
+    if (!plan || !plan.sessions.length) return;
+    const target = plan.sessions.find((s) => s.id === focusSessionId);
+    if (!target) return;
+    const targetDate = new Date(`${target.date}T00:00:00`);
+    const baseMonday = startOfWeekMonday(new Date());
+    const diffDays = Math.floor(
+      (startOfDay(targetDate).getTime() - startOfDay(baseMonday).getTime()) /
+        86_400_000
+    );
+    if (diffDays >= 0) {
+      const newIndex = Math.floor(diffDays / 7) * 7;
+      if (newIndex !== weekStartIndex) {
+        setWeekStartIndex(newIndex);
+      }
+    }
+    setHighlightedSessionId(focusSessionId);
+    const params = new URLSearchParams(searchParams);
+    params.delete("focus");
+    setSearchParams(params, { replace: true });
+  }, [focusSessionId, plan, weekStartIndex, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (!plan || !plan.sessions.length) {
+      setCatchupMessage(null);
+      catchupSignatureRef.current = null;
+      return;
+    }
+    const todayIso = toIsoDate(new Date());
+    const signature = `${todayIso}|${plan.sessions
+      .filter((s) => !isDone(s.status))
+      .map((s) => `${s.id}:${s.date}:${s.startTime}`)
+      .join("|")}`;
+    if (catchupSignatureRef.current === signature) {
+      return;
+    }
+    catchupSignatureRef.current = signature;
+
+    const overdue = plan.sessions.filter(
+      (session) => !isDone(session.status) && session.date < todayIso
+    );
+    if (!overdue.length) {
+      setCatchupMessage(null);
+      return;
+    }
+
+    const res = rescheduleSessions(overdue, preferences, {
+      startDate: new Date(),
+      busyBlocks,
+    });
+
+    if (!res.sessions.length) {
+      setCatchupMessage(
+        "We detected overdue sessions but couldn't find free time. Increase daily focus hours or expand your working window."
+      );
+      return;
+    }
+
+    setPlan((prevPlan) => {
+      if (!prevPlan) return prevPlan;
+      return mergeRescheduledPlan(prevPlan, res, preferences);
+    });
+    setCatchupMessage(
+      `Rolled ${res.sessions.length} overdue session${
+        res.sessions.length === 1 ? "" : "s"
+      } into the next available slots. Review the changes, then apply to calendar to persist them.`
+    );
+    if (
+      res.unplaced.length ||
+      res.warnings.some((warn) => warn.type === "capacity")
+    ) {
+      setCatchupMessage((msg) =>
+        `${msg ?? "Some work still couldn't be placed."} Consider increasing daily focus hours or allowing weekends.`
+      );
+    }
+  }, [plan, preferences, busyBlocks]);
 
   const updatePref = <K extends keyof PlannerPreferences>(
     key: K,
@@ -246,15 +580,22 @@ export default function Planner() {
   ) => {
     setPreferences((prev) => ({ ...prev, [key]: value }));
     setPrefDirty(true);
+    setPrefError(null);
   };
 
   const handleSavePreferences = async () => {
     if (!uid) return;
+    const message = getPreferenceWindowError(preferences);
+    if (message) {
+      setPrefError(message);
+      return;
+    }
     try {
       await setDoc(doc(db, "users", uid, "settings", "planner"), preferences, {
         merge: true,
       });
       setPrefDirty(false);
+      setPrefError(null);
       setSuccessMessage("Preferences saved.");
     } catch (err: any) {
       console.error("[Planner] save preferences failed:", err);
@@ -262,16 +603,93 @@ export default function Planner() {
     }
   };
 
+  const handleDeleteMilestone = useCallback(
+    async (milestone: Milestone) => {
+      if (!uid || !milestone.id) return;
+      const confirm = window.confirm(
+        `Delete milestone "${milestone.title}" from ${milestone.assessmentTitle}?`
+      );
+      if (!confirm) return;
+      setBusy(true);
+      setError(null);
+      let removedSessions = 0;
+      try {
+        await deleteDoc(doc(db, "users", uid, "milestones", milestone.id));
+        await cascadeDeleteMilestone(uid, milestone);
+        setMilestones((prev) =>
+          prev.filter((entry) => entry.id !== milestone.id)
+        );
+        setPlan((prev) => {
+          if (!prev) return prev;
+          const isTarget = (session: PlannedSession) =>
+            session.assessmentTitle === milestone.assessmentTitle &&
+            session.milestoneTitle === milestone.title;
+
+          const filteredSessions = prev.sessions.filter((session) => {
+            const match = isTarget(session);
+            if (match) removedSessions += 1;
+            return !match;
+          });
+
+          const filteredDays = prev.days.map((day) => {
+            const daySessions = day.sessions.filter((session) => !isTarget(session));
+            const totalHours = daySessions.reduce(
+              (total, session) => total + session.durationHours,
+              0
+            );
+            return {
+              ...day,
+              sessions: daySessions,
+              totalHours: Number(totalHours.toFixed(2)),
+            };
+          });
+
+          const filteredUnplaced = prev.unplaced.filter((session) => !isTarget(session));
+
+          if (!filteredSessions.length) {
+            return null;
+          }
+
+          return {
+            ...prev,
+            sessions: filteredSessions,
+            days: filteredDays,
+            unplaced: filteredUnplaced,
+          };
+        });
+        if (removedSessions) {
+          setActivePlanCount((prevCount) =>
+            Math.max(0, prevCount - removedSessions)
+          );
+        }
+        setSuccessMessage(`Removed milestone "${milestone.title}".`);
+      } catch (err: any) {
+        console.error("[Planner] delete milestone failed:", err);
+        setError(err.message || "Failed to delete milestone.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [uid]
+  );
+
   const handleGenerate = async () => {
     if (!milestones.length) {
       alert("Add milestones first via UC2.");
       return;
     }
+    const message = getPreferenceWindowError(preferences);
+    if (message) {
+      setPrefError(message);
+      return;
+    }
+    setPrefError(null);
     setBusy(true);
     setError(null);
     try {
       const raw = planMilestones(milestones, assessments, preferences, {
         startDate: new Date(),
+        busyBlocks,
       });
       const version = raw.version ?? 1;
 
@@ -302,13 +720,11 @@ export default function Planner() {
       alert("Generate a plan with at least one session before applying.");
       return;
     }
-    const confirmReplace =
-      activePlanCount === 0 ||
-      window.confirm(
-        "This will replace your existing calendar plan. Continue?"
-      );
-    if (!confirmReplace) return;
-
+    const message = getPreferenceWindowError(preferences);
+    if (message) {
+      setPrefError(message);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -333,6 +749,90 @@ export default function Planner() {
       setBusy(false);
     }
   };
+
+  const handleManualCatchup = useCallback(() => {
+    if (!plan) {
+      setCatchupMessage("Generate a plan before running catch-up.");
+      return;
+    }
+    const todayIso = toIsoDate(new Date());
+    const overdue = plan.sessions.filter(
+      (session) => !isDone(session.status) && session.date < todayIso
+    );
+    if (!overdue.length) {
+      setCatchupMessage("All sessions are already scheduled on or after today.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = rescheduleSessions(overdue, preferences, {
+        startDate: new Date(),
+        busyBlocks,
+      });
+      if (!res.sessions.length) {
+        setCatchupMessage(
+          "Catch-up couldn’t find space before deadlines. Expand your availability and try again."
+        );
+        return;
+      }
+      setPlan((prev) => {
+        if (!prev) return prev;
+        return mergeRescheduledPlan(prev, res, preferences);
+      });
+      setCatchupMessage(
+        `Catch-up rescheduled ${res.sessions.length} session${
+          res.sessions.length === 1 ? "" : "s"
+        }. Apply to calendar to commit the changes.`
+      );
+      if (
+        res.unplaced.length ||
+        res.warnings.some((warn) => warn.type === "capacity")
+      ) {
+        setCatchupMessage((msg) =>
+          `${msg ?? ""} Some work still needs attention—consider more availability.`
+        );
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [plan, preferences, busyBlocks]);
+
+  const handleUpdateSessionNotes = useCallback(
+    async (sessionId: string, nextNotes: string) => {
+      const timestamp = new Date().toISOString();
+      setPlan((prev) => {
+        if (!prev) return prev;
+        const update = (session: PlannedSession) =>
+          session.id === sessionId
+            ? { ...session, notes: nextNotes, updatedAt: timestamp }
+            : session;
+        return {
+          ...prev,
+          sessions: prev.sessions.map(update),
+          days: prev.days.map((day) => ({
+            ...day,
+            sessions: day.sessions.map(update),
+          })),
+          unplaced: prev.unplaced.map(update),
+        };
+      });
+      setSelectedSession((prev) =>
+        prev && prev.id === sessionId
+          ? { ...prev, notes: nextNotes, updatedAt: timestamp }
+          : prev
+      );
+      if (!uid) return;
+      try {
+        await updateDoc(doc(db, "users", uid, "planSessions", sessionId), {
+          notes: nextNotes,
+          updatedAt: timestamp,
+        });
+      } catch {
+        // ignore — plan may not be applied yet
+      }
+    },
+    [uid]
+  );
 
   // Toggle a session's completion (persist to Firestore if applied)
   const toggleDone = useCallback(
@@ -419,7 +919,7 @@ export default function Planner() {
     <div
       style={{
         minHeight: "100vh",
-        background: "linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%)",
+        background: APP_BACKGROUND,
         padding: "1.25rem",
       }}
     >
@@ -427,7 +927,8 @@ export default function Planner() {
       <div
         style={{
           maxWidth: "1200px",
-          margin: "0 auto 1rem auto",
+          width: "100%",
+          margin: "0 auto 1rem",
           color: "white",
           padding: "1rem 0.5rem",
         }}
@@ -449,11 +950,8 @@ export default function Planner() {
           </div>
           <div>
             <h1 style={{ margin: 0, letterSpacing: "-0.02em" }}>
-              Auto Planner
+              My PlanPoint Calendar
             </h1>
-            <div style={{ opacity: 0.9 }}>
-              Preferences on the left • Calendar on the right
-            </div>
           </div>
         </div>
 
@@ -468,13 +966,15 @@ export default function Planner() {
           <MetricTile
             label="Milestones ready"
             value={milestones.length.toString()}
-            helper="Generated via UC2"
+            helper="Saved from Schedule Ingestion"
           />
           <MetricTile
             label="Active plan sessions"
             value={activePlanCount.toString()}
             helper={
-              activeVersion ? `Version ${activeVersion}` : "No plan applied"
+              activePlanCount
+                ? "Synced to calendar"
+                : "No plan applied yet"
             }
           />
           <MetricTile
@@ -496,10 +996,12 @@ export default function Planner() {
       <div
         style={{
           maxWidth: "1200px",
+          width: "100%",
           margin: "0 auto",
           display: "grid",
-          gridTemplateColumns: "340px 1fr",
+          gridTemplateColumns: "minmax(300px, 360px) minmax(0, 1fr)",
           gap: "1rem",
+          alignItems: "start",
         }}
       >
         {/* LEFT: Preferences & actions */}
@@ -508,7 +1010,7 @@ export default function Planner() {
             background: "white",
             borderRadius: 16,
             boxShadow: "0 18px 40px rgba(14,165,233,0.15)",
-            padding: "1rem",
+            padding: "0.85rem",
           }}
         >
           <h2 style={{ margin: 0, fontSize: "1.1rem", color: "#0f172a" }}>
@@ -517,61 +1019,34 @@ export default function Planner() {
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr",
-              gap: "0.75rem",
+              gridTemplateColumns: "1fr",
+              gap: "0.6rem",
               marginTop: "0.75rem",
             }}
           >
             <NumericField
-              label="Daily focus cap (h)"
+              label="Daily max focus (h)"
               value={preferences.dailyCapHours}
               onChange={(val) => updatePref("dailyCapHours", val)}
               min={1}
-              max={12}
+              max={24}
             />
-            <NumericField
-              label="Min session (min)"
-              value={preferences.minSessionMinutes}
-              onChange={(val) => updatePref("minSessionMinutes", val)}
-              min={15}
-              max={180}
-              step={5}
-            />
-            <NumericField
-              label="Max session (min)"
-              value={preferences.maxSessionMinutes}
-              onChange={(val) => updatePref("maxSessionMinutes", val)}
-              min={30}
-              max={240}
-              step={5}
-            />
-            <NumericField
-              label="Breaks (min)"
-              value={preferences.focusBlockMinutes}
-              onChange={(val) => updatePref("focusBlockMinutes", val)}
-              min={5}
-              max={45}
-              step={5}
-            />
-            <NumericField
-              label="Start hour"
+            <TimeField
+              label="Day start"
               value={preferences.startHour}
               onChange={(val) => updatePref("startHour", val)}
-              min={5}
-              max={12}
-            />
-            <NumericField
-              label="End hour"
-              value={preferences.endHour}
-              onChange={(val) => updatePref("endHour", val)}
-              min={13}
+              min={4}
               max={23}
             />
-          </div>
-
-          <div style={{ marginTop: "0.5rem" }}>
+            <TimeField
+              label="Day end"
+              value={preferences.endHour}
+              onChange={(val) => updatePref("endHour", val)}
+              min={5}
+              max={24}
+            />
             <ToggleField
-              label="Allow weekend sessions"
+              label="Allow weekends"
               checked={preferences.allowWeekends}
               onChange={(val) => updatePref("allowWeekends", val)}
             />
@@ -615,6 +1090,21 @@ export default function Planner() {
             </button>
           </div>
 
+          {prefError && (
+            <div
+              style={{
+                marginTop: "0.5rem",
+                padding: "0.55rem 0.65rem",
+                borderRadius: 10,
+                background: "#fee2e2",
+                color: "#991b1b",
+                fontSize: "0.85rem",
+              }}
+            >
+              {prefError}
+            </div>
+          )}
+
           <button
             onClick={handleApply}
             disabled={busy || !plan}
@@ -635,6 +1125,32 @@ export default function Planner() {
           >
             {busy ? "Applying…" : "Apply to Calendar"}
           </button>
+
+          <button
+            onClick={handleManualCatchup}
+            style={{
+              marginTop: "0.65rem",
+              width: "100%",
+              padding: "0.65rem 1rem",
+              background: "#f1f5f9",
+              color: "#0369a1",
+              border: "1px solid #bae6fd",
+              borderRadius: 10,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Catch-up Reschedule
+          </button>
+          <p
+            style={{
+              marginTop: "0.4rem",
+              color: "#64748b",
+              fontSize: "0.8rem",
+            }}
+          >
+            Pull overdue sessions into the next available study windows without leaving this page.
+          </p>
 
           {error && (
             <div
@@ -662,6 +1178,36 @@ export default function Planner() {
               {successMessage}
             </div>
           )}
+          {catchupMessage && (
+            <div
+              style={{
+                marginTop: "0.75rem",
+                padding: "0.7rem",
+                borderRadius: 10,
+                background: "#fef9c3",
+                color: "#92400e",
+              }}
+            >
+              {catchupMessage}
+            </div>
+          )}
+          {unplacedCount > 0 && (
+            <div
+              style={{
+                marginTop: "0.75rem",
+                padding: "0.7rem",
+                borderRadius: 10,
+                background: "#fee2e2",
+                color: "#b91c1c",
+                fontSize: "0.85rem",
+              }}
+            >
+              ⚠️ Unable to schedule {unplacedCount} session
+              {unplacedCount === 1 ? "" : "s"} before their deadlines. Extend your
+              working window, raise the daily focus cap, or allow weekends, then
+              regenerate.
+            </div>
+          )}
 
           {/* Milestones overview (collapsed list) */}
           <div style={{ marginTop: "1rem" }}>
@@ -686,6 +1232,15 @@ export default function Planner() {
                       (acc, m) => acc + (m.estimateHrs ?? 0),
                       0
                     );
+                    const sorted = [...entries].sort((a, b) => {
+                      const aTime = a.targetDate
+                        ? new Date(a.targetDate).getTime()
+                        : Number.POSITIVE_INFINITY;
+                      const bTime = b.targetDate
+                        ? new Date(b.targetDate).getTime()
+                        : Number.POSITIVE_INFINITY;
+                      return aTime - bTime;
+                    });
                     return (
                       <div key={title} style={{ marginBottom: "0.6rem" }}>
                         <div style={{ fontWeight: 600, color: "#1e293b" }}>
@@ -693,6 +1248,91 @@ export default function Planner() {
                         </div>
                         <div style={{ color: "#64748b", fontSize: "0.85rem" }}>
                           {entries.length} milestones • {total.toFixed(1)}h
+                        </div>
+                        <div style={{ marginTop: "0.35rem", display: "grid", gap: "0.35rem" }}>
+                          {sorted.map((m) => {
+                            const atRisk = unplacedMilestoneKeys.has(
+                              `${m.assessmentTitle}|${m.title}`
+                            );
+                            const targetDate =
+                              parseFlexibleDate(m.targetDate) ??
+                              parseFlexibleDate(m.assessmentDueDate);
+                            const targetLabel = targetDate
+                              ? targetDate.toLocaleDateString("en-AU", {
+                                  weekday: "short",
+                                  month: "short",
+                                  day: "numeric",
+                                  timeZone: "Australia/Sydney",
+                                })
+                              : "No target set";
+                            const estimateLabel =
+                              m.estimateHrs != null
+                                ? `${m.estimateHrs.toFixed(1)}h`
+                              : "n/a";
+                            return (
+                              <div
+                                key={m.id || `${m.title}-${m.targetDate}`}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: "0.5rem",
+                                  padding: "0.45rem 0.55rem",
+                                  border: atRisk ? "1px solid #f87171" : "1px solid #e2e8f0",
+                                  borderRadius: 8,
+                                  background: atRisk ? "#fef2f2" : "#f8fafc",
+                                }}
+                              >
+                                <div>
+                                  <div
+                                    style={{
+                                      fontSize: "0.9rem",
+                                      fontWeight: 600,
+                                      color: atRisk ? "#b91c1c" : "#0f172a",
+                                    }}
+                                  >
+                                    {m.title}
+                                  </div>
+                                  <div
+                                    style={{
+                                      fontSize: "0.8rem",
+                                      color: atRisk ? "#dc2626" : "#475569",
+                                    }}
+                                  >
+                                    Target {targetLabel} • Est. {estimateLabel}
+                                  </div>
+                                  {atRisk && (
+                                    <div
+                                      style={{
+                                        fontSize: "0.72rem",
+                                        fontWeight: 600,
+                                        color: "#b91c1c",
+                                      }}
+                                    >
+                                      Needs more capacity before due date
+                                    </div>
+                                  )}
+                                </div>
+                                <button
+                                  onClick={() => handleDeleteMilestone(m)}
+                                  disabled={busy || !m.id}
+                                  style={{
+                                    padding: "0.35rem 0.55rem",
+                                    fontSize: "0.75rem",
+                                    borderRadius: 6,
+                                    border: "1px solid #f87171",
+                                    background: busy || !m.id ? "#fee2e2" : "#fef2f2",
+                                    color: "#b91c1c",
+                                    cursor:
+                                      busy || !m.id ? "not-allowed" : "pointer",
+                                    fontWeight: 600,
+                                  }}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     );
@@ -709,10 +1349,28 @@ export default function Planner() {
             background: "white",
             borderRadius: 16,
             boxShadow: "0 18px 40px rgba(14,165,233,0.15)",
-            padding: "1rem",
+            padding: "0.9rem",
             minHeight: 600,
+            position: "relative",
+            overflow: "visible",
           }}
         >
+          {emptyState && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                background: "rgba(255,255,255,0.92)",
+                zIndex: 5,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "2rem",
+              }}
+            >
+              <EmptyPlannerGuide onStart={() => navigate("/ingest")} />
+            </div>
+          )}
           <div
             style={{
               display: "flex",
@@ -722,25 +1380,35 @@ export default function Planner() {
             }}
           >
             <div>
-              <h2 style={{ margin: 0, fontSize: "1.1rem", color: "#0f172a" }}>
-                Calendar
-              </h2>
-              <div style={{ color: "#64748b", fontSize: "0.9rem" }}>
-                {plan
-                  ? `Version ${plan.version} • ${plan.sessions.length} sessions`
-                  : "No preview yet"}
-              </div>
+            <h2 style={{ margin: 0, fontSize: "1.1rem", color: "#0f172a" }}>
+              Calendar Preview
+            </h2>
+            <div style={{ color: "#64748b", fontSize: "0.9rem" }}>
+              {plan
+                ? `${plan.sessions.length} session${plan.sessions.length === 1 ? "" : "s"} in this preview`
+                : "No preview yet"}
+            </div>
               <div style={{ color: "#334155", fontWeight: 600, marginTop: 6 }}>
                 {rangeTitle}
               </div>
             </div>
-            <div style={{ display: "flex", gap: "0.5rem" }}>
+            <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
               <button
                 onClick={() => setWeekStartIndex((i) => Math.max(0, i - 7))}
                 disabled={!canPrev}
                 style={navBtnStyle(!canPrev)}
               >
                 ◀ Prev
+              </button>
+              <button
+                onClick={() => {
+                  setWeekStartIndex(0);
+                  setHighlightedSessionId(null);
+                  setSelectedSession(null);
+                }}
+                style={navBtnStyle(false)}
+              >
+                ⬤ Today
               </button>
               <button
                 onClick={() => setWeekStartIndex((i) => (canNext ? i + 7 : i))}
@@ -757,24 +1425,38 @@ export default function Planner() {
             <EmptyCalendarHint />
           ) : (
             <>
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(7, 1fr)",
-                  gap: "0.75rem",
-                  marginTop: "0.75rem",
-                }}
-              >
-                {weekDays.map(
-                  (day: PlanResult["days"][number], idx: number) => (
-                    <DayColumn
-                      key={day.date}
-                      day={day}
-                      onToggleDone={toggleDone}
-                    />
-                  )
-                )}
+              <div style={{ overflowX: "auto", paddingBottom: "0.5rem" }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "120px repeat(7, minmax(210px, 1fr))",
+                    gap: "1rem",
+                    marginTop: "0.75rem",
+                  }}
+                >
+                  <TimeColumn labels={timeLabels} height={columnHeight} />
+                  {weekDays.map((day) => (
+                  <DayColumn
+                    key={day.date}
+                    day={day}
+                    onToggleDone={toggleDone}
+                    highlightedSessionId={highlightedSessionId}
+                    onSelectSession={(session) => setSelectedSession(session)}
+                    subjectLookup={subjectByAssessment}
+                    busyBlocks={busyBlocksByDay.get(day.date) ?? []}
+                    columnHeight={columnHeight}
+                  />
+                ))}
+                </div>
               </div>
+
+              {selectedSession && (
+                <SessionDetail
+                  session={selectedSession}
+                  onClose={() => setSelectedSession(null)}
+                  onSaveNotes={handleUpdateSessionNotes}
+                />
+              )}
 
               {/* Unplaced */}
               {!!plan.unplaced.length && (
@@ -843,24 +1525,72 @@ function EmptyCalendarHint() {
   );
 }
 
+function EmptyPlannerGuide({ onStart }: { onStart: () => void }) {
+  return (
+    <div
+      style={{
+        maxWidth: 480,
+        textAlign: "center",
+        background: "white",
+        borderRadius: 16,
+        padding: "2rem",
+        boxShadow: "0 12px 32px rgba(14,165,233,0.25)",
+      }}
+    >
+      <div style={{ fontSize: "2rem", marginBottom: "0.5rem" }}>🚀</div>
+      <h3 style={{ margin: 0, color: "#0f172a" }}>Let’s get you started</h3>
+      <p style={{ color: "#475569", fontSize: "0.95rem", marginTop: "0.5rem" }}>
+        No milestones or sessions detected yet. Import your timetable or CSV so we can build your study plan automatically.
+      </p>
+      <button
+        onClick={onStart}
+        style={{
+          marginTop: "1rem",
+          padding: "0.75rem 1.5rem",
+          borderRadius: 12,
+          border: "none",
+          background: "linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%)",
+          color: "white",
+          fontWeight: 700,
+          cursor: "pointer",
+          boxShadow: "0 10px 24px rgba(99,102,241,0.35)",
+        }}
+      >
+        Go to Schedule Ingestion
+      </button>
+    </div>
+  );
+}
+
 function DayColumn({
   day,
   onToggleDone,
+  highlightedSessionId,
+  onSelectSession,
+  subjectLookup,
+  busyBlocks,
+  columnHeight,
 }: {
   day: PlanResult["days"][number];
   onToggleDone: (id: string, next: boolean) => void;
+  highlightedSessionId?: string | null;
+  onSelectSession: (session: PlannedSession) => void;
+  subjectLookup: Map<string, string>;
+  busyBlocks: BusyBlock[];
+  columnHeight: number;
 }) {
   return (
     <div
       style={{
         border: "1px solid #e2e8f0",
         borderRadius: 12,
-        padding: "0.75rem",
+        padding: "1rem",
         background: "#ffffff",
-        minHeight: 420,
+        minHeight: columnHeight,
         display: "flex",
         flexDirection: "column",
         gap: "0.5rem",
+        minWidth: 0,
       }}
     >
       <header
@@ -887,6 +1617,73 @@ function DayColumn({
         )}
       </header>
 
+      {busyBlocks.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "0.35rem",
+            marginBottom: "0.25rem",
+          }}
+        >
+          {busyBlocks
+            .slice()
+            .sort(
+              (a, b) =>
+                new Date(a.start).getTime() - new Date(b.start).getTime()
+            )
+            .slice(0, 3)
+            .map((block) => (
+              <span
+                key={`${block.id}-${block.start}`}
+                title={`${block.title} • ${formatTimeRange(block.start, block.end)}`}
+                style={{
+                  borderRadius: 999,
+                  padding: "0.25rem 0.55rem",
+                  background: "#dbeafe",
+                  color: "#1d4ed8",
+                  fontSize: "0.72rem",
+                  fontWeight: 600,
+                  whiteSpace: "nowrap",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.35rem",
+                }}
+              >
+                <span
+                  style={{
+                    maxWidth: 110,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {block.title}
+                </span>
+                <span style={{ fontWeight: 500, color: "#1e3a8a" }}>
+                  {formatTimeRange(block.start, block.end)}
+                </span>
+              </span>
+            ))}
+          {busyBlocks.length > 3 && (
+            <span
+              style={{
+                borderRadius: 999,
+                padding: "0.25rem 0.45rem",
+                background: "#e2e8f0",
+                color: "#475569",
+                fontSize: "0.72rem",
+                fontWeight: 600,
+              }}
+              title={`${busyBlocks.length - 3} more busy block${
+                busyBlocks.length - 3 === 1 ? "" : "s"
+              }`}
+            >
+              +{busyBlocks.length - 3}
+            </span>
+          )}
+        </div>
+      )}
+
       {day.sessions.length === 0 ? (
         <div style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
           No sessions.
@@ -896,7 +1693,16 @@ function DayColumn({
           .slice()
           .sort((a, b) => a.startTime.localeCompare(b.startTime))
           .map((s) => (
-            <SessionCard key={s.id} session={s} onToggleDone={onToggleDone} />
+            <SessionCard
+              key={s.id}
+              session={s}
+              onToggleDone={onToggleDone}
+              highlighted={highlightedSessionId === s.id}
+              onSelect={onSelectSession}
+              subjectLine={
+                subjectLookup.get(s.assessmentTitle) || s.milestoneTitle
+              }
+            />
           ))
       )}
     </div>
@@ -906,72 +1712,89 @@ function DayColumn({
 function SessionCard({
   session,
   onToggleDone,
+  highlighted,
+  onSelect,
+  subjectLine,
 }: {
   session: PlannedSession;
   onToggleDone: (id: string, next: boolean) => void;
+  highlighted?: boolean;
+  onSelect: (session: PlannedSession) => void;
+  subjectLine?: string;
 }) {
   const color = riskColors(session.riskLevel);
+  const borderColor = highlighted ? "#38bdf8" : color.border;
+  const background = highlighted ? "#e0f2fe" : "#ffffff";
+  const header =
+    session.assessmentTitle && session.subtaskTitle
+      ? `${session.assessmentTitle} – ${session.subtaskTitle}`
+      : session.subtaskTitle || session.assessmentTitle;
   return (
     <div
       style={{
         borderRadius: 12,
-        border: `1px solid ${color.border}`,
-        background: color.bg,
+        border: `2px solid ${borderColor}`,
+        background,
         padding: "0.6rem",
-        boxShadow: "0 2px 6px rgba(15,23,42,0.05)",
+        boxShadow: highlighted
+          ? "0 0 0 4px rgba(56,189,248,0.2), 0 6px 18px rgba(15,23,42,0.18)"
+          : "0 2px 6px rgba(15,23,42,0.05)",
+        transition: "box-shadow 0.2s ease",
+        cursor: "pointer",
       }}
+      onClick={() => onSelect(session)}
     >
       <div
         style={{
           display: "flex",
           justifyContent: "space-between",
-          gap: "0.5rem",
+          gap: "0.75rem",
         }}
       >
         <div style={{ fontWeight: 700, color: color.text, flex: 1 }}>
-          {session.subtaskTitle}
+          {header}
         </div>
         <div style={{ fontSize: "0.8rem", color: "#334155" }}>
-          {session.startTime}–{session.endTime}
+          {formatTime12(session.startTime)}–{formatTime12(session.endTime)}
         </div>
       </div>
-      <div
-        style={{ fontSize: "0.85rem", color: "#475569", marginTop: "0.2rem" }}
-      >
-        {session.assessmentTitle} • {session.milestoneTitle}
-      </div>
-      {session.notes && (
-        <div
-          style={{ fontSize: "0.78rem", color: "#64748b", marginTop: "0.2rem" }}
-        >
-          {session.notes}
+      {subjectLine && (
+        <div style={{ fontSize: "0.8rem", color: "#475569", marginTop: "0.2rem" }}>
+          {subjectLine}
         </div>
       )}
       <div
         style={{
           display: "flex",
           justifyContent: "space-between",
-          marginTop: "0.4rem",
+          alignItems: "center",
+          marginTop: "0.6rem",
         }}
       >
-        <span style={{ fontSize: "0.8rem", color: "#475569" }}>
-          {session.durationHours.toFixed(1)}h
-        </span>
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "0.4rem",
-            fontSize: "0.85rem",
-          }}
-        >
-          <input
-            type="checkbox"
-            checked={isDone(session.status)}
-            onChange={(e) => onToggleDone(session.id, e.target.checked)}
-          />
-          Done
-        </label>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.35rem",
+              fontSize: "0.8rem",
+              color: "#0f172a",
+              cursor: "pointer",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <input
+              type="checkbox"
+              checked={isDone(session.status)}
+              onChange={(e) => onToggleDone(session.id, e.target.checked)}
+              style={{ width: 18, height: 18 }}
+            />
+            Done
+          </label>
+          <span style={{ fontSize: "0.8rem", color: "#475569" }}>
+            {session.durationHours.toFixed(1)}h
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -998,9 +1821,9 @@ function MetricTile({
     >
       <div style={{ fontSize: "0.82rem", opacity: 0.9 }}>{label}</div>
       <div style={{ fontSize: "1.3rem", fontWeight: 800 }}>{value}</div>
-      {helper && (
+      {helper ? (
         <div style={{ fontSize: "0.78rem", opacity: 0.85 }}>{helper}</div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -1049,6 +1872,90 @@ function NumericField({
   );
 }
 
+function TimeField({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+}: {
+  label: string;
+  value: number;
+  onChange: (val: number) => void;
+  min: number;
+  max: number;
+}) {
+  const display = toTimeInputValue(value);
+  return (
+    <label
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "0.25rem",
+        fontSize: "0.9rem",
+        color: "#0f172a",
+      }}
+    >
+      {label}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "0.5rem",
+        }}
+      >
+        <input
+          type="time"
+          value={display}
+          step={900}
+          onChange={(e) => {
+            const parsed = fromTimeInputValue(e.target.value);
+            if (Number.isFinite(parsed)) {
+              const clamped = Math.min(max, Math.max(min, parsed));
+              onChange(clamped);
+            }
+          }}
+          style={{
+            padding: "0.55rem 0.65rem",
+            borderRadius: 8,
+            border: "1px solid #cbd5e1",
+            fontSize: "0.95rem",
+          }}
+        />
+        <div style={{ fontSize: "0.8rem", color: "#64748b" }}>
+          {formatDisplayTime(value)}
+        </div>
+      </div>
+    </label>
+  );
+}
+
+function toTimeInputValue(hour: number) {
+  const normalized = ((hour % 24) + 24) % 24;
+  const base = Math.floor(normalized);
+  const minutes = Math.round((normalized - base) * 60);
+  return `${String(base).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function fromTimeInputValue(value: string) {
+  if (!value) return NaN;
+  const [h, m] = value.split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return NaN;
+  return h + m / 60;
+}
+
+function formatDisplayTime(hour: number) {
+  const normalized = ((hour % 24) + 24) % 24;
+  const base = Math.floor(normalized);
+  const minutes = Math.round((normalized - base) * 60);
+  const period = base >= 12 ? "pm" : "am";
+  const displayHour = base % 12 === 0 ? 12 : base % 12;
+  return `${String(displayHour).padStart(2, "0")}:${String(minutes).padStart(
+    2,
+    "0"
+  )} ${period}`;
+}
+
 function ToggleField({
   label,
   checked,
@@ -1063,16 +1970,257 @@ function ToggleField({
       style={{
         display: "flex",
         alignItems: "center",
-        gap: "0.6rem",
-        fontSize: "0.92rem",
+        justifyContent: "space-between",
+        padding: "0.55rem 0.65rem",
+        borderRadius: 8,
+        border: "1px solid #cbd5e1",
+        fontSize: "0.9rem",
+        color: "#0f172a",
       }}
     >
+      {label}
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
+        style={{ width: 18, height: 18, cursor: "pointer" }}
       />
-      {label}
     </label>
   );
+}
+
+const formatTimeRange = (startIso: string, endIso: string) => {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  if (
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime())
+  ) {
+    return `${startIso}–${endIso}`;
+  }
+  const makeLabel = (d: Date) =>
+    formatTime12(`${d.getHours().toString().padStart(2, "0")}:${d
+      .getMinutes()
+      .toString()
+      .padStart(2, "0")}`);
+  return `${makeLabel(start)}–${makeLabel(end)}`;
+};
+
+function TimeColumn({ labels, height }: { labels: string[]; height: number }) {
+  return (
+    <div
+      style={{
+        minHeight: height,
+        padding: "1rem 0.5rem",
+        display: "grid",
+        gridTemplateRows: `repeat(${labels.length}, 1fr)`,
+        color: "#64748b",
+        fontSize: "0.85rem",
+        alignItems: "flex-end",
+      }}
+    >
+      {labels.map((label) => (
+        <div
+          key={label}
+          style={{
+            padding: "0.2rem 0.5rem",
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "flex-end",
+          }}
+        >
+          {label}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SessionDetail({
+  session,
+  onClose,
+  onSaveNotes,
+}: {
+  session: PlannedSession;
+  onClose: () => void;
+  onSaveNotes: (sessionId: string, notes: string) => Promise<void> | void;
+}) {
+  const color = riskColors(session.riskLevel);
+  const [notesValue, setNotesValue] = useState(session.notes ?? "");
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setNotesValue(session.notes ?? "");
+    setDirty(false);
+    setSaving(false);
+  }, [session]);
+
+  const handleSave = async () => {
+    if (!dirty) return;
+    try {
+      setSaving(true);
+      await onSaveNotes(session.id, notesValue.trim());
+      setDirty(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: "1.5rem",
+        right: "1.5rem",
+        width: 320,
+        maxWidth: "90%",
+        background: "white",
+        borderRadius: 16,
+        boxShadow: "0 20px 50px rgba(15,23,42,0.25)",
+        padding: "1.25rem",
+        zIndex: 10,
+      }}
+    >
+      <button
+        onClick={onClose}
+        style={{
+          position: "absolute",
+          top: 12,
+          right: 12,
+          background: "transparent",
+          border: "none",
+          fontSize: "1.1rem",
+          cursor: "pointer",
+          color: "#475569",
+        }}
+        aria-label="Close session details"
+      >
+        ✕
+      </button>
+      <h3 style={{ margin: "0 0 0.4rem 0", color: "#0f172a" }}>
+        {session.subtaskTitle}
+      </h3>
+      <div style={{ color: "#475569", marginBottom: "0.6rem" }}>
+        {longDate(session.date)} • {formatTime12(session.startTime)} –{" "}
+        {formatTime12(session.endTime)}
+      </div>
+      <div
+        style={{
+          background: color.bg,
+          color: color.text,
+          border: `1px solid ${color.border}`,
+          padding: "0.4rem 0.6rem",
+          borderRadius: 999,
+          fontSize: "0.78rem",
+          display: "inline-block",
+          textTransform: "capitalize",
+        }}
+      >
+        {session.riskLevel.replace("-", " ")}
+      </div>
+      <div style={{ marginTop: "0.8rem", color: "#334155", fontSize: "0.9rem" }}>
+        <strong>Assessment:</strong> {session.assessmentTitle}
+        <br />
+        <strong>Milestone:</strong> {session.milestoneTitle}
+        <br />
+        <strong>Duration:</strong> {session.durationHours.toFixed(1)} hours
+      </div>
+      <div style={{ marginTop: "0.8rem" }}>
+        <label
+          style={{
+            display: "block",
+            marginBottom: "0.4rem",
+            color: "#334155",
+            fontSize: "0.85rem",
+            fontWeight: 600,
+          }}
+        >
+          Notes / guidance
+        </label>
+        <textarea
+          value={notesValue}
+          onChange={(e) => {
+            setNotesValue(e.target.value);
+            setDirty(true);
+          }}
+          rows={5}
+          style={{
+            width: "100%",
+            resize: "vertical",
+            fontSize: "0.9rem",
+            padding: "0.65rem",
+            borderRadius: 10,
+            border: "1px solid #cbd5e1",
+            background: "#f8fafc",
+            color: "#0f172a",
+          }}
+          placeholder="Add personalised instructions or reminders for this session."
+        />
+      </div>
+      <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.85rem" }}>
+        <button
+          onClick={handleSave}
+          disabled={!dirty || saving}
+          style={{
+            flex: 1,
+            padding: "0.55rem",
+            borderRadius: 10,
+            border: "none",
+            background:
+              !dirty || saving
+                ? "#e2e8f0"
+                : "linear-gradient(135deg,#22d3ee,#6366f1)",
+            color: !dirty || saving ? "#64748b" : "white",
+            fontWeight: 600,
+            cursor: !dirty || saving ? "not-allowed" : "pointer",
+          }}
+        >
+          {saving ? "Saving…" : "Save notes"}
+        </button>
+        <button
+          onClick={() => onClose()}
+          style={{
+            flex: 1,
+            padding: "0.55rem",
+            borderRadius: 10,
+            border: "1px solid #cbd5e1",
+            background: "white",
+            color: "#475569",
+            fontWeight: 600,
+            cursor: "pointer",
+          }}
+        >
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function generateTimeLabels(startHour: number, endHour: number) {
+  const labels: string[] = [];
+  const start = Math.min(startHour, endHour);
+  const finish = Math.max(startHour, endHour);
+  for (let hour = start; hour <= finish; hour += 1) {
+    labels.push(formatHourLabel(hour));
+  }
+  if (!labels.includes(formatHourLabel(finish))) {
+    labels.push(formatHourLabel(finish));
+  }
+  return labels;
+}
+
+function formatHourLabel(hour: number) {
+  const baseHour = Math.floor(hour);
+  const minutes = Math.round((hour - baseHour) * 60);
+  const date = new Date();
+  date.setHours(baseHour);
+  date.setMinutes(minutes);
+  const opts: Intl.DateTimeFormatOptions = {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  };
+  return date.toLocaleTimeString("en-AU", opts);
 }

@@ -1,7 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { auth, db } from "../firebase";
-import { collection, getDocs, doc, setDoc } from "firebase/firestore";
+import {
+  collection,
+  getDocs,
+  doc,
+  setDoc,
+  query,
+  where,
+  writeBatch,
+} from "firebase/firestore";
 import type { Assessment, Milestone } from "../types";
+import { cascadeDeleteMilestone } from "../lib/dataCleanup";
 
 type MilestonesResponse = {
   milestones: Milestone[];
@@ -12,12 +22,16 @@ type MilestonesResponse = {
 const makeAssessmentKey = (title: string, dueDate?: string) =>
   `${title.trim().toLowerCase()}|${dueDate ? new Date(dueDate).toISOString() : ""}`;
 
+const APP_BACKGROUND = "linear-gradient(135deg,#0f172a 0%,#1d4ed8 100%)";
+
 export default function Milestones() {
+  const navigate = useNavigate();
   const [assessments, setAssessments] = useState<Assessment[]>([]);
   const [selected, setSelected] = useState<Assessment | null>(null);
   const [draft, setDraft] = useState<Milestone[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [generatedFor, setGeneratedFor] = useState<Set<string>>(new Set());
+  const [savedMilestones, setSavedMilestones] = useState<Milestone[]>([]);
   const uid = auth.currentUser?.uid;
 
   useEffect(() => {
@@ -40,13 +54,17 @@ export default function Milestones() {
         setAssessments(assessmentsSnap.docs.map((d) => d.data() as Assessment));
 
         const next = new Set<string>();
-        milestonesSnap.forEach((docSnap) => {
-          const data = docSnap.data() as Milestone;
+        const stored: Milestone[] = milestonesSnap.docs.map((docSnap) => {
+      const data = docSnap.data() as Milestone;
+      return { ...data, id: docSnap.id };
+        });
+        stored.forEach((data) => {
           if (data.assessmentTitle) {
             next.add(makeAssessmentKey(data.assessmentTitle, data.assessmentDueDate));
           }
         });
         setGeneratedFor(next);
+        setSavedMilestones(stored);
       } catch (error) {
         console.error("[Milestones] failed to load data", error);
       }
@@ -94,6 +112,7 @@ export default function Milestones() {
         ...m,
         assessmentTitle: m.assessmentTitle ?? a.title,
         assessmentDueDate: m.assessmentDueDate ?? a.dueDate,
+        description: m.description,
       }));
       setDraft(sanitized);
     } catch (e: any) {
@@ -107,29 +126,61 @@ export default function Milestones() {
     if (!uid || !draft?.length) return;
     const col = collection(db, "users", uid, "milestones");
     const selectedAssessment = selected;
-    await Promise.all(
-      draft.map((m) =>
-        setDoc(
-          doc(col),
-          {
-            ...m,
-            assessmentTitle: selectedAssessment?.title ?? m.assessmentTitle,
-            assessmentDueDate: selectedAssessment?.dueDate ?? m.assessmentDueDate,
-          }
-        )
-      )
+    const targetTitle = selectedAssessment?.title ?? draft[0].assessmentTitle;
+    const existingSnap = await getDocs(
+      query(col, where("assessmentTitle", "==", targetTitle))
     );
-    if (selectedAssessment) {
-      const key = makeAssessmentKey(selectedAssessment.title, selectedAssessment.dueDate);
-      setGeneratedFor((prev) => {
-        const next = new Set(prev);
-        next.add(key);
-        return next;
+    const existingMilestones = existingSnap.docs.map((docSnap) => ({
+      id: docSnap.id,
+      ...(docSnap.data() as Milestone),
+    }));
+
+    const batch = writeBatch(db);
+    existingSnap.forEach((docSnap) => batch.delete(docSnap.ref));
+
+    draft.forEach((m) => {
+      const ref = doc(col);
+      batch.set(ref, {
+        ...m,
+        assessmentTitle: selectedAssessment?.title ?? m.assessmentTitle,
+        assessmentDueDate:
+          selectedAssessment?.dueDate ?? m.assessmentDueDate,
       });
+    });
+
+    await batch.commit();
+
+    if (existingMilestones.length) {
+      await Promise.all(
+        existingMilestones.map((m) =>
+          cascadeDeleteMilestone(uid, {
+            assessmentTitle: m.assessmentTitle,
+            title: m.title,
+          })
+        )
+      );
     }
-    alert("Milestones saved!");
+    const key = makeAssessmentKey(
+      selectedAssessment?.title ?? targetTitle,
+      selectedAssessment?.dueDate ?? draft[0].assessmentDueDate
+    );
+    const updatedGenerated = new Set(generatedFor);
+    updatedGenerated.add(key);
+    setGeneratedFor(updatedGenerated);
+
     setDraft(null);
     setSelected(null);
+
+    const allGenerated =
+      assessments.length > 0 &&
+      assessments.every((assessment) =>
+        updatedGenerated.has(
+          makeAssessmentKey(assessment.title, assessment.dueDate)
+        )
+      );
+    if (allGenerated) {
+      navigate("/planner");
+    }
   }
 
   // Helper function to get days until due date
@@ -146,10 +197,53 @@ export default function Milestones() {
     return { bg: '#f0fdf4', border: '#bbf7d0', text: '#16a34a' };
   };
 
+  const savedByAssessment = useMemo(() => {
+    const map = new Map<string, { assessment?: Assessment; items: Milestone[] }>();
+    savedMilestones.forEach((m) => {
+      if (!map.has(m.assessmentTitle)) {
+        map.set(m.assessmentTitle, {
+          assessment: assessments.find((a) => a.title === m.assessmentTitle) ?? undefined,
+          items: [],
+        });
+      }
+      map.get(m.assessmentTitle)!.items.push(m);
+    });
+    map.forEach((value) => {
+      value.items.sort((a, b) => {
+        const aDate = a.targetDate ? new Date(a.targetDate).getTime() : Number.POSITIVE_INFINITY;
+        const bDate = b.targetDate ? new Date(b.targetDate).getTime() : Number.POSITIVE_INFINITY;
+        return aDate - bDate;
+      });
+    });
+    return map;
+  }, [savedMilestones, assessments]);
+
+  const handleEditSaved = (title: string) => {
+    const entry = savedByAssessment.get(title);
+    if (!entry) return;
+    const items = entry.items.map(({ id: _id, ...rest }) => ({
+      ...rest,
+    }));
+    const assessment =
+      entry.assessment ??
+      assessments.find((a) => a.title === title) ??
+      ({
+        title,
+        dueDate:
+          entry.items[0]?.assessmentDueDate ??
+          new Date().toISOString(),
+        weight: undefined,
+        course: undefined,
+      } as Assessment);
+    setSelected(assessment);
+    setDraft(items);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   return (
     <div style={{ 
       minHeight: '100vh',
-      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+      background: APP_BACKGROUND,
       padding: '2rem 1rem'
     }}>
       <div style={{ 
@@ -221,7 +315,7 @@ export default function Milestones() {
                 color: '#6b7280',
                 fontSize: '1rem'
               }}>
-                Upload your assessments on the Ingest page first to generate milestones.
+                Upload your assessments on the Schedule Ingestion page first to generate milestones.
               </p>
             </div>
           ) : (
@@ -377,6 +471,124 @@ export default function Milestones() {
                 })}
               </div>
             </>
+          )}
+
+          {savedByAssessment.size > 0 && (
+            <div
+              style={{
+                marginTop: '2rem',
+                background: '#f8fafc',
+                borderRadius: 16,
+                border: '1px solid #e2e8f0',
+                padding: '1.5rem',
+              }}
+            >
+              <h3 style={{ margin: 0, color: '#0f172a', fontSize: '1.1rem' }}>
+                Saved milestones
+              </h3>
+              <p style={{ color: '#64748b', margin: '0.35rem 0 1rem 0', fontSize: '0.9rem' }}>
+                Expand an assessment to quickly review the milestones you’ve already saved.
+              </p>
+              <div style={{ display: 'grid', gap: '0.75rem' }}>
+                {Array.from(savedByAssessment.entries()).map(([title, payload]) => {
+                  const assessment = payload.assessment;
+                  return (
+                    <details
+                      key={title}
+                      style={{
+                        border: '1px solid #e2e8f0',
+                        borderRadius: 12,
+                        background: 'white',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <summary
+                        style={{
+                          padding: '0.9rem 1rem',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          listStyle: 'none',
+                          fontWeight: 600,
+                          color: '#0f172a',
+                        }}
+                      >
+                        <span>{title}</span>
+                        <span style={{ fontSize: '0.85rem', color: '#475569' }}>
+                          {payload.items.length} milestone{payload.items.length === 1 ? '' : 's'}
+                        </span>
+                      </summary>
+                      <div style={{ padding: '0.85rem 1rem', borderTop: '1px solid #e2e8f0' }}>
+                        {assessment?.dueDate && (
+                          <div style={{ marginBottom: '0.6rem', fontSize: '0.85rem', color: '#475569' }}>
+                            Due {new Date(assessment.dueDate).toLocaleString('en-AU', {
+                              weekday: 'short',
+                              day: 'numeric',
+                              month: 'short',
+                              hour: 'numeric',
+                              minute: '2-digit',
+                              hour12: true,
+                            })}
+                          </div>
+                        )}
+                        <ul style={{ margin: 0, padding: 0, listStyle: 'none', display: 'grid', gap: '0.5rem' }}>
+                          {payload.items.map((m) => (
+                            <li
+                              key={`${m.title}-${m.targetDate ?? ''}`}
+                              style={{
+                                padding: '0.55rem 0.75rem',
+                                borderRadius: 10,
+                                background: '#f9fafb',
+                                border: '1px solid #e2e8f0',
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                                gap: '0.5rem',
+                                fontSize: '0.9rem',
+                              }}
+                            >
+                              <div>
+                                <div style={{ fontWeight: 600, color: '#1e293b' }}>{m.title}</div>
+                                <div style={{ fontSize: '0.8rem', color: '#64748b' }}>
+                                  Target {m.targetDate ? new Date(m.targetDate).toLocaleDateString('en-AU', {
+                                    weekday: 'short',
+                                    month: 'short',
+                                    day: 'numeric',
+                                  }) : 'unspecified'}
+                                </div>
+                              </div>
+                              {typeof m.estimateHrs === 'number' && (
+                                <span style={{ fontSize: '0.8rem', color: '#475569', fontWeight: 600 }}>
+                                  {m.estimateHrs.toFixed(1)}h
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                        <div style={{ marginTop: '0.75rem', display: 'flex', justifyContent: 'flex-end' }}>
+                          <button
+                            onClick={() => handleEditSaved(title)}
+                            style={{
+                              padding: '0.55rem 0.85rem',
+                              borderRadius: 8,
+                              border: '1px solid #a855f7',
+                              background: 'linear-gradient(135deg,#7c3aed 0%,#a855f7 100%)',
+                              color: 'white',
+                              fontSize: '0.85rem',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            Edit milestones
+                          </button>
+                        </div>
+                      </div>
+                    </details>
+                  );
+                })}
+              </div>
+            </div>
           )}
 
           {draft && selected && (

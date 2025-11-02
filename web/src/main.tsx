@@ -3,11 +3,10 @@ import ReactDOM from "react-dom/client";
 import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import Login from "./pages/Login";
 import SignUp from "./pages/SignUp";
+import Home from "./pages/Home";
 import Ingest from "./pages/Ingest";
 import Milestones from "./pages/Milestones";
 import Planner from "./pages/Planner";
-import Progress from "./pages/Progress";
-import Notifications from "./pages/Notifications";
 import AuthGate from "./components/AuthGate";
 import Header from "./components/Header";
 import "./index.css";
@@ -41,22 +40,6 @@ const router = createBrowserRouter([
     ),
   },
   {
-    path: "/progress",
-    element: (
-      <AuthGate>
-        <Shell><Progress /></Shell>
-      </AuthGate>
-    ),
-  },
-  {
-    path: "/notifications",
-    element: (
-      <AuthGate>
-        <Shell><Notifications /></Shell>
-      </AuthGate>
-    ),
-  },
-  {
     path: "/milestones",
     element: (
       <AuthGate>
@@ -64,12 +47,11 @@ const router = createBrowserRouter([
       </AuthGate>
     ),
   },
-  // default route → guarded ingest
   {
     path: "/",
     element: (
       <AuthGate>
-        <Shell><Ingest /></Shell>
+        <Shell><Home /></Shell>
       </AuthGate>
     ),
   },

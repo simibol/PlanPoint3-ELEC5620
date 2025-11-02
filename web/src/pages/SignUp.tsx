@@ -54,11 +54,15 @@ export default function SignUp() {
     }
 
     try {
-      const result = await signUpWithEmail(email, password, displayName || undefined);
+      const result = await signUpWithEmail(
+        email,
+        password,
+        displayName || undefined
+      );
       if (result.success) {
-        setSuccess("Account created successfully! Redirecting...");
+        setSuccess("Account created successfully! You can sign in now.");
         setTimeout(() => {
-          nav(from, { replace: true });
+          nav("/login", { replace: true });
         }, 1500);
       } else {
         setError(result.error || "Failed to create account.");

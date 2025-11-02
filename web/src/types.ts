@@ -14,11 +14,21 @@ export type Assessment = {
   rubricText?: string;
 };
 export type Milestone = {
+  id?: string;
   title: string;
   targetDate: string;
   estimateHrs?: number;
   assessmentTitle: string;
   assessmentDueDate?: string;
+  description?: string;
+};
+
+export type BusyBlock = {
+  id: string;
+  title: string;
+  start: string;
+  end: string;
+  sourceUploadId?: string | null;
 };
 
 export type PlannerPreferences = {
@@ -119,4 +129,18 @@ export type PlanSession = {
   notes?: string;
   riskLevel: "on-track" | "warning" | "late";
   done?: boolean; // ← add this
+};
+
+export type ProgressAuditAction = "status-change" | "reschedule";
+
+export type ProgressAudit = {
+  id?: string;
+  action: ProgressAuditAction;
+  sessionId?: string;
+  sessionTitle?: string;
+  assessmentTitle?: string;
+  beforeStatus?: SessionStatus;
+  afterStatus?: SessionStatus;
+  note?: string;
+  createdAt: string;
 };

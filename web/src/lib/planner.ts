@@ -9,9 +9,16 @@ import {
   NotificationItem,
   NotificationState,
   WeeklyProgress,
+  BusyBlock,
 } from "../types";
 
 const MS_PER_DAY = 86_400_000;
+const EPSILON = 1e-4;
+
+type Slot = {
+  start: number;
+  end: number;
+};
 
 export const DEFAULT_PREFERENCES: PlannerPreferences = {
   dailyCapHours: 4,
@@ -38,9 +45,12 @@ type SubtaskInput = {
 
 type MutableDay = DaySummary & {
   workedHours: number;
-  offsetHours: number;
   assessmentLoad: Record<string, number>;
+  availableSlots: Slot[];
 };
+
+const isSessionCompleted = (status: string | undefined) =>
+  status === "completed" || status === "complete";
 
 export function withDefaults(
   prefs?: Partial<PlannerPreferences>
@@ -63,6 +73,20 @@ const startOfDay = (d: Date) => {
   return out;
 };
 
+const parseIsoDate = (value?: string | null) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return startOfDay(parsed);
+};
+
+const toLocalDateKey = (d: Date) => {
+  const year = d.getFullYear();
+  const month = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
 const startOfWeek = (d: Date) => {
   const date = startOfDay(d);
   const day = date.getDay();
@@ -82,9 +106,7 @@ const isWeekend = (d: Date) => {
   return day === 0 || day === 6;
 };
 
-const formatDateKey = (d: Date) => {
-  return d.toISOString().slice(0, 10);
-};
+const formatDateKey = (d: Date) => toLocalDateKey(d);
 
 const parseDateKey = (key: string) => {
   return startOfDay(new Date(`${key}T00:00:00`));
@@ -100,6 +122,141 @@ const toTimeString = (decimalHour: number) => {
 
 const clamp = (val: number, min: number, max: number) =>
   Math.max(min, Math.min(max, val));
+
+const sumSlotHours = (slots: Slot[]) =>
+  slots.reduce((total, slot) => total + Math.max(0, slot.end - slot.start), 0);
+
+const splitBusyBlocks = (
+  busyBlocks: BusyBlock[],
+  rangeStart: Date,
+  rangeEnd: Date
+): Map<string, Slot[]> => {
+  const map = new Map<string, Slot[]>();
+  if (!busyBlocks.length) return map;
+
+  const minDay = startOfDay(rangeStart);
+  const maxDay = startOfDay(rangeEnd);
+  const rangeEndMs = addDays(maxDay, 1).getTime();
+
+  busyBlocks.forEach((block) => {
+    const rawStart = new Date(block.start);
+    const rawEnd = new Date(block.end);
+    const startMs = rawStart.getTime();
+    const endMs = rawEnd.getTime();
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+    if (endMs <= startMs) return;
+    if (endMs <= minDay.getTime() || startMs >= rangeEndMs) return;
+
+    let cursor = startOfDay(rawStart);
+    if (cursor.getTime() < minDay.getTime()) {
+      cursor = new Date(minDay);
+    }
+
+    while (cursor.getTime() <= maxDay.getTime()) {
+      const dayStartMs = cursor.getTime();
+      const dayEndMs = dayStartMs + MS_PER_DAY;
+      if (dayStartMs >= endMs) break;
+
+      const overlapStart = Math.max(startMs, dayStartMs);
+      const overlapEnd = Math.min(endMs, dayEndMs);
+      if (overlapEnd > overlapStart + EPSILON) {
+        const dayKey = formatDateKey(cursor);
+        const startHour = (overlapStart - dayStartMs) / 3_600_000;
+        const endHour = (overlapEnd - dayStartMs) / 3_600_000;
+        if (!map.has(dayKey)) map.set(dayKey, []);
+        map.get(dayKey)!.push({
+          start: Number(startHour.toFixed(4)),
+          end: Number(endHour.toFixed(4)),
+        });
+      }
+
+      if (dayEndMs >= endMs) break;
+      cursor = addDays(cursor, 1);
+    }
+  });
+
+  // Ensure busy blocks per day are sorted
+  map.forEach((list, key) => {
+    map.set(
+      key,
+      list
+        .slice()
+        .sort((a, b) => a.start - b.start)
+        .map((slot) => ({
+          start: Number(slot.start.toFixed(4)),
+          end: Number(slot.end.toFixed(4)),
+        }))
+    );
+  });
+
+  return map;
+};
+
+const createDailySlots = (
+  prefs: PlannerPreferences,
+  busy: Slot[] | undefined,
+  isWeekend: boolean
+): Slot[] => {
+  if (!prefs.allowWeekends && isWeekend) return [];
+
+  const windowStart = prefs.startHour;
+  const windowEnd = prefs.endHour;
+  if (windowEnd <= windowStart) return [];
+
+  let slots: Slot[] = [{ start: windowStart, end: windowEnd }];
+
+  if (busy?.length) {
+    for (const block of busy) {
+      const busyStart = clamp(block.start, windowStart, windowEnd);
+      const busyEnd = clamp(block.end, windowStart, windowEnd);
+      if (busyEnd <= busyStart + EPSILON) continue;
+
+      const next: Slot[] = [];
+      for (const slot of slots) {
+        if (busyEnd <= slot.start + EPSILON || busyStart >= slot.end - EPSILON) {
+          next.push(slot);
+          continue;
+        }
+
+        if (busyStart > slot.start + EPSILON) {
+          next.push({
+            start: slot.start,
+            end: busyStart,
+          });
+        }
+
+        if (busyEnd < slot.end - EPSILON) {
+          next.push({
+            start: busyEnd,
+            end: slot.end,
+          });
+        }
+      }
+      slots = next;
+      if (!slots.length) break;
+    }
+  }
+
+  return slots
+    .map((slot) => ({
+      start: Number(slot.start.toFixed(4)),
+      end: Number(slot.end.toFixed(4)),
+    }))
+    .filter((slot) => slot.end - slot.start > 1 / 60);
+};
+
+const findPlacementInSlots = (
+  slots: Slot[],
+  duration: number
+): { index: number; start: number } | null => {
+  for (let i = 0; i < slots.length; i += 1) {
+    const slot = slots[i];
+    if (slot.end - slot.start + EPSILON >= duration) {
+      return { index: i, start: slot.start };
+    }
+  }
+  return null;
+};
 
 const divideHours = (
   totalHours: number,
@@ -122,6 +279,172 @@ const divideHours = (
   return parts;
 };
 
+const MICRO_MIN_HOURS = 0.25;
+
+const createPlaceholderSession = (
+  sub: SubtaskInput,
+  remainingHours: number,
+  version: number,
+  blockedBy: string | undefined,
+  preserveIds?: boolean
+): PlannedSession => {
+  const placeholderId = preserveIds
+    ? `${sub.id}-unplaced-${Math.random().toString(36).slice(2, 6)}`
+    : makeId(`${sub.id}-unplaced`);
+  const nowIso = new Date().toISOString();
+  const session: PlannedSession = {
+    id: placeholderId,
+    assessmentTitle: sub.assessmentTitle,
+    assessmentDueDate: sub.assessmentDueDate,
+    milestoneTitle: sub.milestoneTitle,
+    subtaskTitle: sub.subtaskTitle,
+    date: sub.dueDate,
+    startTime: "09:00",
+    endTime: "10:00",
+    durationHours: Number(remainingHours.toFixed(2)),
+    status: "planned",
+    notes: sub.notes,
+    riskLevel: "at-risk",
+    version,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+  if (blockedBy) {
+    session.blockedBy = blockedBy;
+  }
+  return session;
+};
+
+const allocateDeferredSubtasks = (
+  deferred: {
+    sub: SubtaskInput;
+    blockedBy?: string;
+    reason: "capacity" | "conflict";
+  }[],
+  days: MutableDay[],
+  prefs: PlannerPreferences,
+  version: number,
+  sessions: PlannedSession[],
+  warnings: PlanWarning[],
+  lastSessionByMilestone: Map<string, string>,
+  options?: ScheduleOptions
+): PlannedSession[] => {
+  if (!deferred.length) return [];
+  const leftovers: PlannedSession[] = [];
+  const nowIso = new Date().toISOString();
+  const minChunk = Math.min(prefs.minSessionMinutes / 60, MICRO_MIN_HOURS);
+  const maxChunk = prefs.maxSessionMinutes / 60;
+
+  deferred.forEach(({ sub, blockedBy }) => {
+    let remaining = Number(sub.durationHours.toFixed(2));
+    const dueTs = parseDateKey(sub.dueDate).getTime();
+    let splitIndex = 0;
+
+    for (const day of days) {
+      const dayDate = parseDateKey(day.date).getTime();
+      if (dayDate > dueTs + EPSILON) break;
+      let slotIndex = 0;
+      while (
+        slotIndex < day.availableSlots.length &&
+        remaining > minChunk - EPSILON
+      ) {
+        const slot = day.availableSlots[slotIndex];
+        const slotLength = slot.end - slot.start;
+        const dayRemainingCap = Math.max(0, day.capacity - day.workedHours);
+        const usable = Math.min(
+          slotLength,
+          dayRemainingCap,
+          maxChunk,
+          remaining
+        );
+        if (usable < minChunk - EPSILON) {
+          slotIndex += 1;
+          continue;
+        }
+        const duration = Number(usable.toFixed(2));
+        const start = slot.start;
+        const end = start + duration;
+        const sessionId = options?.preserveIds
+          ? `${sub.id}-split-${splitIndex}`
+          : makeId(`${sub.id}-split-${splitIndex}`);
+        const sessionTitle =
+          splitIndex === 0
+            ? `${sub.subtaskTitle} (split)`
+            : `${sub.subtaskTitle} (split ${splitIndex + 1})`;
+        const session: PlannedSession = {
+          id: sessionId,
+          assessmentTitle: sub.assessmentTitle,
+          assessmentDueDate: sub.assessmentDueDate,
+          milestoneTitle: sub.milestoneTitle,
+          subtaskTitle: sessionTitle,
+          date: day.date,
+          startTime: toTimeString(start),
+          endTime: toTimeString(end),
+          durationHours: duration,
+          status: "planned",
+          notes: sub.notes,
+          riskLevel: "on-track",
+          version,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        const prior = lastSessionByMilestone.get(sub.milestoneTitle);
+        if (blockedBy && splitIndex === 0) {
+          session.blockedBy = blockedBy;
+        } else if (prior) {
+          session.blockedBy = prior;
+        }
+
+        day.sessions.push(session);
+        day.sessions.sort((a, b) => a.startTime.localeCompare(b.startTime));
+        day.workedHours = Number((day.workedHours + duration).toFixed(2));
+        day.totalHours = day.workedHours;
+        day.assessmentLoad[sub.assessmentTitle] =
+          (day.assessmentLoad[sub.assessmentTitle] || 0) + 1;
+
+        if (end >= slot.end - EPSILON) {
+          day.availableSlots.splice(slotIndex, 1);
+        } else {
+          day.availableSlots[slotIndex] = {
+            start: Number(end.toFixed(4)),
+            end: slot.end,
+          };
+          slotIndex += 1;
+        }
+
+        sessions.push(session);
+        lastSessionByMilestone.set(sub.milestoneTitle, sessionId);
+        blockedBy = sessionId;
+        remaining = Number((remaining - duration).toFixed(2));
+        splitIndex += 1;
+      }
+      if (remaining <= minChunk - EPSILON) break;
+    }
+
+    if (remaining > minChunk - EPSILON) {
+      leftovers.push(
+        createPlaceholderSession(
+          sub,
+          remaining,
+          version,
+          blockedBy,
+          options?.preserveIds
+        )
+      );
+      warnings.push({
+        type: "capacity",
+        message: `Only partially scheduled "${sub.subtaskTitle}". ${remaining.toFixed(
+          1
+        )}h still needs time before ${sub.dueDate}.`,
+        detail:
+          "Expand availability, allow weekends, or reduce session length to place the remaining work.",
+      });
+    }
+  });
+
+  return leftovers;
+};
+
 const createSubtasks = (
   milestone: Milestone,
   assessment: Assessment | undefined,
@@ -129,23 +452,47 @@ const createSubtasks = (
 ): SubtaskInput[] => {
   const total = Math.max(milestone.estimateHrs ?? 2, 1);
   const segments = divideHours(total, prefs);
-  const dueDate = milestone.targetDate || assessment?.dueDate || new Date().toISOString();
+  const milestoneDue = parseIsoDate(milestone.targetDate);
+  const assessmentDue = parseIsoDate(assessment?.dueDate);
+  let dueCandidate: Date | null = null;
+  if (milestoneDue && assessmentDue) {
+    dueCandidate =
+      milestoneDue.getTime() <= assessmentDue.getTime()
+        ? milestoneDue
+        : assessmentDue;
+  } else {
+    dueCandidate = milestoneDue ?? assessmentDue ?? startOfDay(new Date());
+  }
+  const dueDate = toLocalDateKey(dueCandidate);
+  const assessmentDueIso = assessmentDue ? toLocalDateKey(assessmentDue) : dueDate;
   const importance =
     (assessment?.weight ?? 10) +
     Math.max(0, 50 - Math.min(50, segments.length * 5));
 
   return segments.map((hours, index) => {
     const base = milestone.title.toLowerCase();
-    let notes = "";
-    if (base.includes("research") || base.includes("review")) {
-      notes = "Gather sources and capture notes in reference doc.";
-    } else if (base.includes("draft")) {
-      notes = "Focus on producing a rough draft; ignore polish for now.";
-    } else if (base.includes("edit") || base.includes("revise")) {
-      notes = "Work through feedback and tighten structure.";
-    } else if (base.includes("plan") || base.includes("outline")) {
-      notes = "Define sections, deliverables, and success criteria.";
+    const llmNotes = milestone.description?.trim();
+    let notes = llmNotes ?? "";
+    if (!notes) {
+      if (base.includes("research") || base.includes("review")) {
+        notes = "Gather sources and capture notes in reference doc.";
+      } else if (base.includes("draft")) {
+        notes = "Focus on producing a rough draft; ignore polish for now.";
+      } else if (base.includes("edit") || base.includes("revise")) {
+        notes = "Work through feedback and tighten structure.";
+      } else if (base.includes("plan") || base.includes("outline")) {
+        notes = "Define sections, deliverables, and success criteria.";
+      }
     }
+    const sessionNotesRaw =
+      segments.length === 1
+        ? notes
+        : notes
+        ? index === 0
+          ? notes
+          : `Continue: ${notes}`
+        : "";
+    const sessionNotes = sessionNotesRaw ?? "";
 
     const subtaskTitle =
       segments.length === 1
@@ -155,11 +502,11 @@ const createSubtasks = (
     return {
       id: `${milestone.assessmentTitle}-${milestone.title}-${index}`,
       assessmentTitle: milestone.assessmentTitle,
-      assessmentDueDate: milestone.assessmentDueDate || dueDate,
+      assessmentDueDate: assessmentDueIso,
       milestoneTitle: milestone.title,
       subtaskTitle,
       durationHours: Number(hours.toFixed(2)),
-      notes,
+      notes: sessionNotes,
       order: index,
       dueDate,
       weightScore: importance,
@@ -171,6 +518,7 @@ type ScheduleOptions = {
   startDate?: Date;
   version?: number;
   preserveIds?: boolean;
+  busyBlocks?: BusyBlock[];
 };
 
 const scheduleSubtasks = (
@@ -181,6 +529,7 @@ const scheduleSubtasks = (
   const prefs = withDefaults(preferences);
   const start = startOfDay(options?.startDate || new Date());
   const version = options?.version ?? Date.now();
+  const busyBlocks = options?.busyBlocks ?? [];
 
   if (!subtasks.length) {
     return {
@@ -194,14 +543,14 @@ const scheduleSubtasks = (
 
   const sortedSubtasks = [...subtasks].sort((a, b) => {
     const dueDiff =
-      new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime();
+      parseDateKey(a.dueDate).getTime() - parseDateKey(b.dueDate).getTime();
     if (dueDiff !== 0) return dueDiff;
     if (b.weightScore !== a.weightScore) return b.weightScore - a.weightScore;
     return a.order - b.order;
   });
 
   let maxDue = sortedSubtasks.reduce((latest, sub) => {
-    const due = new Date(sub.dueDate).getTime();
+    const due = parseDateKey(sub.dueDate).getTime();
     return due > latest ? due : latest;
   }, start.getTime());
   if (maxDue < start.getTime()) {
@@ -209,6 +558,7 @@ const scheduleSubtasks = (
   }
 
   const end = addDays(new Date(maxDue), 7);
+  const busyIndex = splitBusyBlocks(busyBlocks, start, end);
   const days: MutableDay[] = [];
 
   for (
@@ -216,22 +566,24 @@ const scheduleSubtasks = (
     cursor <= end;
     cursor = addDays(cursor, 1)
   ) {
+    const dateKey = formatDateKey(cursor);
     const weekend = isWeekend(cursor);
-    const baseCapacity = prefs.dailyCapHours;
-    const dailyWindow = prefs.endHour - prefs.startHour;
+    const busyForDay = busyIndex.get(dateKey);
+    const availableSlots = createDailySlots(prefs, busyForDay, weekend);
+    const slotHours = sumSlotHours(availableSlots);
     const capacity = Math.min(
-      baseCapacity,
-      dailyWindow > 0 ? dailyWindow : baseCapacity
+      prefs.dailyCapHours,
+      slotHours > 0 ? slotHours : 0
     );
     days.push({
-      date: formatDateKey(cursor),
+      date: dateKey,
       isWeekend: weekend,
-      capacity: !prefs.allowWeekends && weekend ? 0 : capacity,
+      capacity: Number(capacity.toFixed(2)),
       totalHours: 0,
       sessions: [],
       workedHours: 0,
-      offsetHours: 0,
       assessmentLoad: {},
+      availableSlots,
     });
   }
 
@@ -239,6 +591,11 @@ const scheduleSubtasks = (
   const unplaced: PlannedSession[] = [];
   const sessions: PlannedSession[] = [];
   const lastSessionByMilestone = new Map<string, string>();
+  const deferred: {
+    sub: SubtaskInput;
+    blockedBy?: string;
+    reason: "capacity" | "conflict";
+  }[] = [];
 
   sortedSubtasks.forEach((sub) => {
     if (sub.durationHours <= 0) return;
@@ -253,9 +610,11 @@ const scheduleSubtasks = (
       if (dayDate.getTime() < start.getTime()) continue;
 
       if (day.workedHours + sub.durationHours > day.capacity + 0.01) continue;
-      const projectedOffset =
-        day.offsetHours + sub.durationHours + (day.workedHours > 0 ? prefs.focusBlockMinutes / 60 : 0);
-      if (prefs.startHour + projectedOffset > prefs.endHour + 0.01) continue;
+      const placement = findPlacementInSlots(
+        day.availableSlots,
+        sub.durationHours
+      );
+      if (!placement) continue;
 
       const diffDays = (dueTs - dayDate.getTime()) / MS_PER_DAY;
       const load = day.assessmentLoad[sub.assessmentTitle] ?? 0;
@@ -277,15 +636,29 @@ const scheduleSubtasks = (
       }
     }
 
-    const targetDay = chosen || fallback?.day || null;
-    const riskLevel: "on-track" | "warning" | "at-risk" =
-      !targetDay || parseDateKey(targetDay.date).getTime() > dueTs
-        ? "at-risk"
-        : Math.abs(
-            parseDateKey(targetDay.date).getTime() - dueTs
-          ) <= MS_PER_DAY
-        ? "warning"
-        : "on-track";
+    if (!chosen && fallback?.day) {
+      warnings.push({
+        type: "deadline",
+        message: `"${sub.subtaskTitle}" overflowed the due date and was placed at the next available slot.`,
+        detail:
+          "Increase your daily focus hours, expand the working window, or allow weekends to keep sessions before the deadline.",
+      });
+      chosen = fallback.day;
+    }
+
+    const targetDay = chosen || null;
+    let riskLevel: "on-track" | "warning" | "at-risk";
+    if (!targetDay) {
+      riskLevel = "at-risk";
+    } else {
+      const scheduledTs = parseDateKey(targetDay.date).getTime();
+      if (scheduledTs > dueTs) {
+        const deltaDays = Math.round((scheduledTs - dueTs) / MS_PER_DAY);
+        riskLevel = deltaDays <= 1 ? "warning" : "at-risk";
+      } else {
+        riskLevel = "on-track";
+      }
+    }
 
     if (!targetDay) {
       warnings.push({
@@ -294,33 +667,37 @@ const scheduleSubtasks = (
         detail:
           "Increase daily capacity, allow weekends, or reduce session duration.",
       });
-      const placeholderId = options?.preserveIds ? sub.id : makeId(sub.id);
-      const placeholder: PlannedSession = {
-        id: placeholderId,
-        assessmentTitle: sub.assessmentTitle,
-        assessmentDueDate: sub.assessmentDueDate,
-        milestoneTitle: sub.milestoneTitle,
-        subtaskTitle: sub.subtaskTitle,
-        date: formatDateKey(new Date(sub.dueDate)),
-        startTime: "09:00",
-        endTime: "10:00",
-        durationHours: sub.durationHours,
-        status: "pending",
-        notes: sub.notes,
-        riskLevel: "at-risk",
-        version,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        blockedBy: sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined,
-      };
-      unplaced.push(placeholder);
+      const blockedBy =
+        sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
+      deferred.push({ sub, blockedBy, reason: "capacity" });
       return;
     }
 
-    const startTimeDecimal =
-      prefs.startHour + targetDay.offsetHours + (targetDay.workedHours > 0 ? prefs.focusBlockMinutes / 60 : 0);
+    const placement = findPlacementInSlots(
+      targetDay.availableSlots,
+      sub.durationHours
+    );
+
+    if (!placement) {
+      warnings.push({
+        type: "conflict",
+        message: `Busy times prevented scheduling "${sub.subtaskTitle}" on ${targetDay.date}.`,
+        detail:
+          "Adjust busy calendar entries or expand availability to free up space.",
+      });
+      const blockedBy =
+        sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
+      deferred.push({ sub, blockedBy, reason: "conflict" });
+      return;
+    }
+
+    const slot = targetDay.availableSlots[placement.index];
+    const slotEnd = slot.end;
+    const startTimeDecimal = placement.start;
     const endTimeDecimal = startTimeDecimal + sub.durationHours;
     const sessionId = options?.preserveIds ? sub.id : makeId(sub.id);
+    const blockedBy =
+      sub.order > 0 ? lastSessionByMilestone.get(sub.milestoneTitle) : undefined;
     const session: PlannedSession = {
       id: sessionId,
       assessmentTitle: sub.assessmentTitle,
@@ -331,45 +708,48 @@ const scheduleSubtasks = (
       startTime: toTimeString(startTimeDecimal),
       endTime: toTimeString(endTimeDecimal),
       durationHours: sub.durationHours,
-      status: "pending",
+      status: "planned",
       notes: sub.notes,
       riskLevel,
       version,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      blockedBy:
-        sub.order > 0
-          ? lastSessionByMilestone.get(sub.milestoneTitle)
-          : undefined,
+      ...(blockedBy ? { blockedBy } : {}),
     };
 
     targetDay.sessions.push(session);
     targetDay.workedHours = Number(
       (targetDay.workedHours + sub.durationHours).toFixed(2)
     );
-    targetDay.offsetHours = Number(
-      (
-        targetDay.offsetHours +
-        sub.durationHours +
-        (targetDay.workedHours > 0 &&
-        targetDay.workedHours < targetDay.capacity
-          ? prefs.focusBlockMinutes / 60
-          : 0)
-      ).toFixed(2)
-    );
     targetDay.totalHours = targetDay.workedHours;
     targetDay.assessmentLoad[sub.assessmentTitle] =
       (targetDay.assessmentLoad[sub.assessmentTitle] || 0) + 1;
+
+    const shouldAddBreak =
+      targetDay.workedHours < targetDay.capacity - 0.01 &&
+      prefs.focusBlockMinutes > 0;
+    const breakHours = shouldAddBreak ? prefs.focusBlockMinutes / 60 : 0;
+    const nextStart = endTimeDecimal + breakHours;
+    if (nextStart >= slotEnd - EPSILON) {
+      targetDay.availableSlots.splice(placement.index, 1);
+    } else {
+      targetDay.availableSlots[placement.index] = {
+        start: Number(nextStart.toFixed(4)),
+        end: slotEnd,
+      };
+    }
 
     if (riskLevel !== "on-track") {
       warnings.push({
         type: riskLevel === "warning" ? "deadline" : "capacity",
         message: `"${sub.subtaskTitle}" is scheduled ${
-          riskLevel === "warning" ? "on its due date" : "after its due date"
+          riskLevel === "warning"
+            ? "the day after its due date"
+            : "after its due date"
         }.`,
         detail:
           riskLevel === "warning"
-            ? "Consider starting earlier to leave review time."
+            ? "Consider pulling this forward so you finish on or before the deadline."
             : "Increase daily capacity or extend availability to avoid lateness.",
       });
     }
@@ -377,6 +757,20 @@ const scheduleSubtasks = (
     sessions.push(session);
     lastSessionByMilestone.set(sub.milestoneTitle, sessionId);
   });
+
+  if (deferred.length) {
+    const micro = allocateDeferredSubtasks(
+      deferred,
+      days,
+      prefs,
+      version,
+      sessions,
+      warnings,
+      lastSessionByMilestone,
+      options
+    );
+    unplaced.push(...micro);
+  }
 
   const daySummaries: DaySummary[] = days.map((day) => ({
     date: day.date,
@@ -399,7 +793,7 @@ export const planMilestones = (
   milestones: Milestone[],
   assessments: Assessment[],
   preferences?: Partial<PlannerPreferences>,
-  options?: { startDate?: Date }
+  options?: { startDate?: Date; busyBlocks?: BusyBlock[] }
 ): PlanResult => {
   const prefs = withDefaults(preferences);
   const assessmentByTitle = new Map(
@@ -420,11 +814,11 @@ export const planMilestones = (
 export const rescheduleSessions = (
   sessions: PlannedSession[],
   preferences?: Partial<PlannerPreferences>,
-  options?: { startDate?: Date }
+  options?: { startDate?: Date; busyBlocks?: BusyBlock[] }
 ): PlanResult => {
   const prefs = withDefaults(preferences);
   const subtasks: SubtaskInput[] = sessions
-    .filter((s) => s.status !== "complete")
+    .filter((s) => !isSessionCompleted(s.status))
     .map((session, index) => ({
       id: session.id,
       assessmentTitle: session.assessmentTitle,
@@ -454,7 +848,7 @@ export const generateNotifications = (
   const nowMs = now.getTime();
 
   sessions.forEach((session) => {
-    if (session.status === "complete") return;
+    if (isSessionCompleted(session.status)) return;
     const sessionDate = parseDateKey(session.date);
     const sessionStart = new Date(sessionDate);
     const [hours, minutes] = session.startTime.split(":").map(Number);
@@ -551,7 +945,7 @@ export const buildWeeklySummaries = (
     }
     const entry = map.get(key)!;
     entry.planned += session.durationHours;
-    if (session.status === "complete") {
+    if (isSessionCompleted(session.status)) {
       entry.complete += session.durationHours;
     }
   });
