@@ -7,7 +7,6 @@ import Home from "./pages/Home";
 import Ingest from "./pages/Ingest";
 import Milestones from "./pages/Milestones";
 import Planner from "./pages/Planner";
-import Progress from "./pages/Progress";
 import AuthGate from "./components/AuthGate";
 import Header from "./components/Header";
 import "./index.css";
@@ -37,14 +36,6 @@ const router = createBrowserRouter([
     element: (
       <AuthGate>
         <Shell><Planner /></Shell>
-      </AuthGate>
-    ),
-  },
-  {
-    path: "/progress",
-    element: (
-      <AuthGate>
-        <Shell><Progress /></Shell>
       </AuthGate>
     ),
   },

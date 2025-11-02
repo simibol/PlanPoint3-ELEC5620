@@ -18,7 +18,6 @@ export default function App() {
         <Link to="/ingest">Upload Schedule (UC1)</Link>
         <Link to="/milestones">Milestones (UC2)</Link>
         <Link to="/planner">Auto Planner (UC3)</Link>
-        <Link to="/progress">Progress Tracker (UC4)</Link>
       </nav>
     </div>
   );
