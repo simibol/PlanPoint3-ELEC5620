@@ -208,6 +208,16 @@ function summariseSessions(
     });
 }
 
+const pad = (value: number) => value.toString().padStart(2, "0");
+
+const toDayKey = (value: string) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate()
+  )}`;
+};
+
 function mergeRescheduledPlan(
   basePlan: PlanResult,
   res: PlanResult,
@@ -442,6 +452,16 @@ export default function Planner() {
     );
   }, [plan]);
   const unplacedCount = plan?.unplaced?.length ?? 0;
+  const busyBlocksByDay = useMemo(() => {
+    const map = new Map<string, BusyBlock[]>();
+    busyBlocks.forEach((block) => {
+      const key = toDayKey(block.start);
+      if (!key) return;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(block);
+    });
+    return map;
+  }, [busyBlocks]);
 
   const lastPlanSignatureRef = useRef<string | null>(null);
   const catchupSignatureRef = useRef<string | null>(null);
@@ -1377,6 +1397,7 @@ export default function Planner() {
                     highlightedSessionId={highlightedSessionId}
                     onSelectSession={(session) => setSelectedSession(session)}
                     subjectLookup={subjectByAssessment}
+                    busyBlocks={busyBlocksByDay.get(day.date) ?? []}
                   />
                 ))}
                 </div>
@@ -1499,12 +1520,14 @@ function DayColumn({
   highlightedSessionId,
   onSelectSession,
   subjectLookup,
+  busyBlocks,
 }: {
   day: PlanResult["days"][number];
   onToggleDone: (id: string, next: boolean) => void;
   highlightedSessionId?: string | null;
   onSelectSession: (session: PlannedSession) => void;
   subjectLookup: Map<string, string>;
+  busyBlocks: BusyBlock[];
 }) {
   return (
     <div
@@ -1543,6 +1566,73 @@ function DayColumn({
           </span>
         )}
       </header>
+
+      {busyBlocks.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "0.35rem",
+            marginBottom: "0.25rem",
+          }}
+        >
+          {busyBlocks
+            .slice()
+            .sort(
+              (a, b) =>
+                new Date(a.start).getTime() - new Date(b.start).getTime()
+            )
+            .slice(0, 3)
+            .map((block) => (
+              <span
+                key={`${block.id}-${block.start}`}
+                title={`${block.title} • ${formatTimeRange(block.start, block.end)}`}
+                style={{
+                  borderRadius: 999,
+                  padding: "0.25rem 0.55rem",
+                  background: "#dbeafe",
+                  color: "#1d4ed8",
+                  fontSize: "0.72rem",
+                  fontWeight: 600,
+                  whiteSpace: "nowrap",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.35rem",
+                }}
+              >
+                <span
+                  style={{
+                    maxWidth: 110,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                >
+                  {block.title}
+                </span>
+                <span style={{ fontWeight: 500, color: "#1e3a8a" }}>
+                  {formatTimeRange(block.start, block.end)}
+                </span>
+              </span>
+            ))}
+          {busyBlocks.length > 3 && (
+            <span
+              style={{
+                borderRadius: 999,
+                padding: "0.25rem 0.45rem",
+                background: "#e2e8f0",
+                color: "#475569",
+                fontSize: "0.72rem",
+                fontWeight: 600,
+              }}
+              title={`${busyBlocks.length - 3} more busy block${
+                busyBlocks.length - 3 === 1 ? "" : "s"
+              }`}
+            >
+              +{busyBlocks.length - 3}
+            </span>
+          )}
+        </div>
+      )}
 
       {day.sessions.length === 0 ? (
         <div style={{ color: "#94a3b8", fontSize: "0.85rem" }}>
@@ -1848,6 +1938,25 @@ function ToggleField({
     </label>
   );
 }
+
+const formatTimeRange = (startIso: string, endIso: string) => {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  if (
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime())
+  ) {
+    return `${startIso}–${endIso}`;
+  }
+  const makeLabel = (d: Date) => {
+    const hours = d.getHours();
+    const minutes = d.getMinutes();
+    const period = hours >= 12 ? "pm" : "am";
+    const displayHour = hours % 12 === 0 ? 12 : hours % 12;
+    return `${displayHour}:${minutes.toString().padStart(2, "0")}${period}`;
+  };
+  return `${makeLabel(start)}–${makeLabel(end)}`;
+};
 
 function TimeColumn({ labels }: { labels: string[] }) {
   return (
