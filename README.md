@@ -125,12 +125,19 @@ Artefacts available in our Jira board:
 
 ---
 
-## 8. Contribution Workflow
+## 8. Contribution Workflow & Team Roles
 
-1. Branch from `main` using `feature/<summary>` or `bugfix/<summary>`
-2. Run `npm run build` before pushing
-3. Open PR with linked Jira story, screenshots/GIFs, and manual checklist results
-4. At least one teammate reviews before merge
+- Branch from `main` using `feature/<summary>` or `bugfix/<summary>`.
+- Run `npm run build` before pushing to ensure the bundle stays healthy.
+- Open PRs with linked Jira story, screenshots/GIFs, and manual checklist results.
+- At least one teammate reviews before merge.
+
+**Team contributions**
+
+- **Bianca Douroudis** – Lead implementation across ingestion, milestones, planner, and catch-up; LLM prompt tuning; UI polish.
+- **Simon Bolger** – Firebase and Cloudflare setup, deployment pipeline, environment scaffolding, build tooling.
+- **Sam Kertesz** – Sign-up/login flows, UI refinements, end-to-end testing, Jira coordination.
+- **Chris Hu** – Jira board ownership, sprint tracking, QA coordination and feedback.
 
 ---
 
