@@ -17,6 +17,7 @@ cp /path/to/shared/.env.local web/.env.local
 ```
 
 ### Terminal 1 – Vite dev server
+
 ```bash
 cd PlanPoint3-ELEC5620/web
 npm install            # or pnpm install
@@ -24,6 +25,7 @@ npm run dev            # serves on http://localhost:5173
 ```
 
 ### Terminal 2 – Cloudflare Pages functions proxy
+
 ```bash
 cd PlanPoint3-ELEC5620/web
 npx wrangler pages dev --proxy 5173 --compatibility-date=2025-10-15
@@ -31,20 +33,20 @@ npx wrangler pages dev --proxy 5173 --compatibility-date=2025-10-15
 
 **Open the app:** [http://localhost:8788](http://localhost:8788)
 
-*(Stick with the package manager you install with to avoid lockfile churn; `pnpm-lock.yaml` is provided.)*
+_(Stick with the package manager you install with to avoid lockfile churn; `pnpm-lock.yaml` is provided.)_
 
 ---
 
 ## 2. System Overview
 
-| Capability | Summary |
-| --- | --- |
-| **Schedule Ingestion (UC1)** | Upload CSV assessment schedules, attach PDF specs/rubrics, import ICS availability, and edit rows inline before saving to Firestore. |
-| **Milestone Generation (UC2)** | Uses OpenAI GPT-4o-mini to transform assessment + rubric/spec context into milestones with descriptions, target dates, and effort estimates. |
-| **Planner (UC3 / UC6)** | Builds a 7-day rolling study calendar, respects busy blocks and preferences, offers Catch-up Reschedule with change diffs, and surfaces the LLM-authored guidance inside each study session. |
-| **Progress Dashboard (UC4 / UC5)** | Summarises progress, upcoming reminders, and completion KPIs; nudges students when a new plan is required. |
+- **Schedule Ingestion (UC1):** Upload CSV assessment schedules, attach PDF specs/rubrics, import ICS availability, and edit rows inline before saving to Firestore.
+- **Milestone Generation (UC2):** Uses OpenAI GPT-4o-mini to transform assessment + rubric/spec context into milestones with descriptions, target dates, and effort estimates.
+- **Planner (UC3):** Builds a 7-day rolling study calendar, respects busy blocks and preferences, and surfaces the LLM-authored guidance inside each study session.
+- **Progress Dashboard (UC4 / UC5):** Summarises progress, upcoming reminders, and completion KPIs; nudges students when a new plan is required.
+- **Catch-up Reschedule (UC6):** Auto-detects overdue sessions, recomputes the plan respecting preferences and availability, and shows an inline change log plus Apply button so students can commit the new version after reviewing the moves.
 
 ### Architecture at a Glance
+
 - React + TypeScript (Vite) front-end (`web/src`)
 - Firebase Firestore & Storage + Firebase Auth
 - Cloudflare Pages functions (`web/functions`) for serverless APIs
@@ -55,13 +57,13 @@ npx wrangler pages dev --proxy 5173 --compatibility-date=2025-10-15
 
 ## 3. Configuration Map
 
-| Item | Location | Notes |
-| --- | --- | --- |
-| Environment variables | `web/.env.local` | Copy from shared source; never commit. |
-| Firebase init | `web/src/firebase.ts` | Reads values from `.env.local`. |
-| LLM API | `web/functions/api/generate-milestones.ts` | Calls OpenAI with rubric/spec text. |
-| Domain types | `web/src/types.ts` | Shared definitions for assessments, milestones, sessions, busy blocks. |
-| Planner engine | `web/src/lib/planner.ts` | Scheduling logic, catch-up reschedule helpers. |
+| Item                  | Location                                   | Notes                                                                  |
+| --------------------- | ------------------------------------------ | ---------------------------------------------------------------------- |
+| Environment variables | `web/.env.local`                           | Copy from shared source; never commit.                                 |
+| Firebase init         | `web/src/firebase.ts`                      | Reads values from `.env.local`.                                        |
+| LLM API               | `web/functions/api/generate-milestones.ts` | Calls OpenAI with rubric/spec text.                                    |
+| Domain types          | `web/src/types.ts`                         | Shared definitions for assessments, milestones, sessions, busy blocks. |
+| Planner engine        | `web/src/lib/planner.ts`                   | Scheduling logic, catch-up reschedule helpers.                         |
 
 ---
 
@@ -116,28 +118,14 @@ All are fully integrated and verified via manual QA.
 - **Sprint 3** – Catch-up reschedule enhancements, planner polish, progress dashboard, QA hardening
 
 Artefacts available in our Jira board:
+
 - Sprint goals, burndown charts, demo recordings
 - User stories with acceptance criteria & story points
 - Retrospectives documenting feedback loops and action items
 
 ---
 
-## 8. Manual Regression Checklist (v1.0)
-
-| Area | Key Checks |
-| --- | --- |
-| Schedule Ingestion | CSV upload + manual edits, PDF attachments, ICS import, unlock/edit/save cycle |
-| Milestones | Generate per assessment (observe LLM output in descriptions), ensure banner & redirect only after all generated, edit saved entries |
-| Planner | Generate plan, verify busy-time conflict handling, Apply to Calendar with success message, column layout, session drawers show LLM-authored guidance |
-| Catch-up | Overdue sessions produce change list + CTA referencing milestone context; no-overdue path yields “up to date”; over-capacity shows warnings |
-| Progress/Home | Notifications, metrics, first-time prompt to Schedule Ingestion |
-| Build | `npm run build` to confirm production bundle |
-
-Record pass/fail notes (screenshots encouraged) alongside Jira QA tickets.
-
----
-
-## 9. Contribution Workflow
+## 8. Contribution Workflow
 
 1. Branch from `main` using `feature/<summary>` or `bugfix/<summary>`
 2. Run `npm run build` before pushing
@@ -146,7 +134,7 @@ Record pass/fail notes (screenshots encouraged) alongside Jira QA tickets.
 
 ---
 
-## 10. Future Enhancements
+## 9. Future Enhancements
 
 - Automated Jest + Playwright suites
 - "What-if" sandbox planning scenarios
@@ -154,4 +142,3 @@ Record pass/fail notes (screenshots encouraged) alongside Jira QA tickets.
 - Analytics correlating LLM-generated workload with actual completion
 
 ---
-
