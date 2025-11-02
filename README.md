@@ -155,8 +155,3 @@ Record pass/fail notes (screenshots encouraged) alongside Jira QA tickets.
 
 ---
 
-## 11. Credits
-
-- Product & ML design: Bianca Douroudis, Simon Bolomope, team
-- Scrum facilitation: H. Tran (Jira cadences, retros)
-- LLM prompt iteration: Sprint 2 pilot with live rubric PDFs
